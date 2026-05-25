@@ -73,6 +73,10 @@ export class NodeSnapshotError extends ComfyUIError {
   constructor(message: string, details?: unknown) {
     super(message, "NODE_SNAPSHOT_ERROR", details);
     this.name = "NodeSnapshotError";
+export class NodeBisectError extends ComfyUIError {
+  constructor(message: string, details?: unknown) {
+    super(message, "NODE_BISECT_ERROR", details);
+    this.name = "NodeBisectError";
   }
 }
 
