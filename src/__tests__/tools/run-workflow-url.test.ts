@@ -39,6 +39,12 @@ vi.mock("../../services/workflow-executor.js", () => ({
   enqueueWorkflow: (...a: unknown[]) => enqueueWorkflowMock(...a),
 }));
 
+// Mock DNS so resolution is deterministic + offline. Default: a public IP.
+const lookupMock = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
+vi.mock("node:dns/promises", () => ({
+  lookup: (...a: unknown[]) => lookupMock(...a),
+}));
+
 import { registerWorkflowUrlTools } from "../../tools/workflow-url.js";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
@@ -73,6 +79,8 @@ beforeEach(() => {
   validateWorkflowMock.mockClear();
   enqueueWorkflowMock.mockClear();
   fetchMock.mockReset();
+  lookupMock.mockReset();
+  lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -143,6 +151,43 @@ describe("run_workflow_url", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/http\/https/i);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks a hostname that DNS-resolves to a private IP (rebinding)", async () => {
+    // Host passes the literal check, but resolves to an internal address.
+    lookupMock.mockResolvedValue([{ address: "10.0.0.5", family: 4 }]);
+    fetchMock.mockResolvedValue(jsonResponse(API_WF));
+    const handler = getHandler("run_workflow_url");
+
+    const res = await handler({ url: "https://evil.example.com/wf.json" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/resolves to internal\/private|DNS-rebinding/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks an IPv6 ULA resolution too", async () => {
+    lookupMock.mockResolvedValue([{ address: "fd00::1", family: 6 }]);
+    const handler = getHandler("run_workflow_url");
+    const res = await handler({ url: "https://evil6.example.com/wf.json" });
+    expect(res.isError).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a redirect response instead of following it", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { location: "http://169.254.169.254/latest/meta-data/" },
+      }),
+    );
+    const handler = getHandler("run_workflow_url");
+
+    const res = await handler({ url: "https://example.com/redirector" });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/redirect/i);
+    expect(enqueueWorkflowMock).not.toHaveBeenCalled();
   });
 
   it("returns a clear error for an unsupported share host", async () => {

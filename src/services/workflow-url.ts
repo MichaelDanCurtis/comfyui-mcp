@@ -1,3 +1,4 @@
+import { lookup } from "node:dns/promises";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -5,6 +6,8 @@ import { logger } from "../utils/logger.js";
 const DEFAULT_TIMEOUT_MS = 15_000;
 /** Default cap on the workflow payload size (workflows are JSON, rarely > a few MB). */
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
+/** Default cap on the DNS lookup so a slow/hanging resolver can't stall the tool. */
+const DEFAULT_DNS_TIMEOUT_MS = 5_000;
 
 /**
  * Known "share" hosts that serve an HTML page (or require an authenticated API
@@ -83,9 +86,9 @@ export function normalizeWorkflowUrl(rawUrl: string): string {
  * avoid SSRF (e.g. tricking the server into fetching its own /admin or the cloud
  * metadata endpoint at 169.254.169.254).
  *
- * Note: this checks the literal host/IP in the URL. It does not resolve DNS, so
- * a public hostname that resolves to a private IP (DNS rebinding) is not caught
- * here — redirects are followed by fetch and are likewise not re-validated.
+ * This is the LITERAL-host check; `fetchWorkflowFromUrl` additionally resolves
+ * the hostname via DNS and re-runs these checks against every resolved address
+ * (defeating DNS-rebinding) and refuses to follow redirects.
  */
 export function assertSafeUrl(rawUrl: string): URL {
   let u: URL;
@@ -160,17 +163,82 @@ function isBlockedIpv4(ip: string): boolean {
   return false;
 }
 
+/** Reject a promise that doesn't settle within `ms`, with a clear label. */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Resolve a hostname and reject if ANY resolved address is internal/private.
+ * This defeats DNS-rebinding: a hostname that passes the literal-host check but
+ * resolves to loopback/RFC1918/link-local/metadata/CGNAT/IPv6-ULA is blocked.
+ * IP literals resolve to themselves, so this is a no-op-but-safe for those.
+ * Bounded so a slow resolver can't hang the tool. Exported for testing.
+ */
+export async function assertHostResolvesSafe(
+  host: string,
+  timeoutMs: number = DEFAULT_DNS_TIMEOUT_MS,
+): Promise<void> {
+  let results: Array<{ address: string }>;
+  try {
+    results = await withTimeout(
+      lookup(host, { all: true }),
+      timeoutMs,
+      `DNS lookup for "${host}"`,
+    );
+  } catch (err) {
+    const e = err as Error;
+    throw new ValidationError(
+      `Could not resolve host "${host}": ${e?.message ?? err}`,
+    );
+  }
+
+  if (!results || results.length === 0) {
+    throw new ValidationError(`Host "${host}" did not resolve to any address.`);
+  }
+
+  for (const r of results) {
+    if (isBlockedHost(r.address)) {
+      throw new ValidationError(
+        `Refusing to fetch "${host}" — it resolves to internal/private address ` +
+          `${r.address} (SSRF guard / DNS-rebinding protection).`,
+      );
+    }
+  }
+}
+
 /**
  * Fetch and JSON-parse a workflow from a remote URL with SSRF, timeout, and
  * size guards. Throws ValidationError (never a raw fetch error) on any failure
  * so callers can surface a clean message via errorToToolResult.
+ *
+ * SSRF defenses: http/https only; literal-host check; DNS resolution with every
+ * resolved address re-checked against the private/internal ranges; and redirects
+ * are NOT followed (a 30x to an internal target is rejected — raw workflow-JSON
+ * hosts don't need redirects, and GitHub blob→raw is normalized up front).
  */
 export async function fetchWorkflowFromUrl(
   rawUrl: string,
-  opts?: { timeoutMs?: number; maxBytes?: number },
+  opts?: { timeoutMs?: number; maxBytes?: number; dnsTimeoutMs?: number },
 ): Promise<FetchWorkflowResult> {
   const normalized = normalizeWorkflowUrl(rawUrl);
   const u = assertSafeUrl(normalized);
+  await assertHostResolvesSafe(u.hostname, opts?.dnsTimeoutMs ?? DEFAULT_DNS_TIMEOUT_MS);
 
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = opts?.maxBytes ?? DEFAULT_MAX_BYTES;
@@ -182,7 +250,9 @@ export async function fetchWorkflowFromUrl(
   try {
     res = await fetch(u, {
       signal: controller.signal,
-      redirect: "follow",
+      // Do NOT auto-follow redirects — a public URL could 30x to an internal
+      // target that bypasses the DNS/host checks above.
+      redirect: "manual",
       headers: { Accept: "application/json, text/plain;q=0.9, */*;q=0.5" },
     });
   } catch (err) {
@@ -195,6 +265,20 @@ export async function fetchWorkflowFromUrl(
     throw new ValidationError(`Failed to fetch workflow URL: ${e?.message ?? err}`);
   } finally {
     clearTimeout(timer);
+  }
+
+  // redirect:"manual" surfaces redirects as an opaqueredirect response (status 0
+  // in Node/undici) or, in test doubles, a literal 3xx. Reject either rather
+  // than following into a possibly-internal Location.
+  if (
+    res.type === "opaqueredirect" ||
+    res.status === 0 ||
+    (res.status >= 300 && res.status < 400)
+  ) {
+    throw new ValidationError(
+      `Workflow URL responded with a redirect (status ${res.status}) — redirects are ` +
+        `not followed (SSRF guard). Use the final direct .json URL instead.`,
+    );
   }
 
   if (!res.ok) {
