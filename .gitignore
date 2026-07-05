@@ -23,6 +23,7 @@ generations.db-shm
 # Generated agent directories
 .agents/
 .gemini/commands/
+.omc/
 
 # Orchestrator debug logs
 panel-load-smoke-orch.log
