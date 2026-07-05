@@ -16,11 +16,12 @@ Extend comfyui-mcp orchestrator + panel with multi-provider agents, cross-provid
 - Panel tools: `panel_open_lora_manager`, `panel_pick_lora` ([lora-manager.md](./lora-manager.md))
 - **Panel follow-up:** browse/pick UI with preview grid; implement `open_lora_manager` / `pick_lora` bridge handlers
 
-## Phase 1 — Grok backend (P0)
+## Phase 1 — Grok backend (orchestrator done)
 
-- `GrokBackend` implementing `AgentBackend` (OAuth via Grok Build / xAI CLI)
-- Add `grok` to `BackendId`, readiness probe, panel provider chip
-- Spike: auth token location, chat/tool wire format, MCP over HTTP parity
+- `GrokBackend` implementing `AgentBackend` via `grok agent stdio` (ACP, OAuth at `~/.grok/auth.json`)
+- `grok` in `BackendId`, readiness probe, single-port multi-provider wiring (`COMFYUI_MCP_GROK_MODEL`)
+- MCP parity: headless `comfyui` stdio + loopback `panel` HTTP (same as codex/gemini)
+- **Panel follow-up:** add Grok to the provider chip UI if not already present
 
 ## Phase 2 — Cross-provider concept images (P1)
 
