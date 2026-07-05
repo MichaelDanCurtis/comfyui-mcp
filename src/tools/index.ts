@@ -39,6 +39,7 @@ import { registerWorkspaceEnvTools } from "./workspace-env.js";
 import { registerApiNodesTools } from "./api-nodes.js";
 import { registerManagerConfigTools } from "./manager-config.js";
 import { registerManifestTools } from "./manifest.js";
+import { registerLoraManagerTools } from "./lora-manager.js";
 import { registerImageConvertTools } from "./image-convert.js";
 import { registerColorAnalysisTools } from "./color-analysis.js";
 import { registerStorageUploadTools } from "./storage-upload.js";
@@ -88,6 +89,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerInstallComfyUITools],
   ["server", registerUpdateComfyUITools],
   ["models", registerModelExtrasTools],
+  ["models", registerLoraManagerTools],
   ["models", registerExtraPathsTools],
   ["server", registerWorkspaceEnvTools],
   ["generation", registerApiNodesTools],
