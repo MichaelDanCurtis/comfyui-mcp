@@ -31,6 +31,7 @@
     "test:local-llm": "npm run build && node scripts/test-local-llm.mjs",
     "arena": "npm run build && node scripts/llm-arena.mjs",
     "smoke:panel": "npm run build && node scripts/panel-smoke.mjs",
+    "test:mcp-local": "npm run build && node scripts/test-mcp-local.mjs",
     "lint": "tsc --noEmit",
     "docs:gen": "cross-env COMFYUI_URL=http://127.0.0.1:8188 tsx scripts/gen-tool-docs.ts",
     "runpod:release": "node scripts/runpod-release.mjs",
