@@ -6,10 +6,12 @@
 //
 // Bound to 127.0.0.1 only; never exposed off-host.
 
+import { createReadStream, existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { extname, join, resolve } from "node:path";
 import { allBackendReadiness } from "./backend-readiness.js";
 import { listTrainingPacks } from "../services/training-pack.js";
-import { getLoraCatalog } from "../services/lora-catalog.js";
+import { getLoraCatalog, loraPreviewsDir } from "../services/lora-catalog.js";
 import { photomapHealth } from "../services/photomap.js";
 import { logger } from "../utils/logger.js";
 
@@ -47,6 +49,51 @@ function sendHtml(res: ServerResponse, status: number, html: string): void {
     "Cache-Control": "no-store",
   });
   res.end(html);
+}
+
+const PREVIEW_MIME: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+function serveLoraPreview(req: IncomingMessage, res: ServerResponse): void {
+  let id = "";
+  try {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    id = (url.searchParams.get("id") ?? "").trim();
+  } catch {
+    sendJson(res, 400, { ok: false, error: "bad request" });
+    return;
+  }
+  if (!id) {
+    sendJson(res, 400, { ok: false, error: "id required" });
+    return;
+  }
+  const catalog = getLoraCatalog();
+  const entry = catalog.get(id);
+  if (!entry?.previewFile) {
+    sendJson(res, 404, { ok: false, error: "no preview" });
+    return;
+  }
+  const previewsRoot = resolve(loraPreviewsDir());
+  const abs = resolve(join(previewsRoot, entry.previewFile));
+  if (!abs.startsWith(previewsRoot + "/") && abs !== previewsRoot) {
+    sendJson(res, 403, { ok: false, error: "invalid preview path" });
+    return;
+  }
+  if (!existsSync(abs)) {
+    sendJson(res, 404, { ok: false, error: "preview file missing" });
+    return;
+  }
+  const mime = PREVIEW_MIME[extname(abs).toLowerCase()] ?? "application/octet-stream";
+  res.writeHead(200, {
+    "Content-Type": mime,
+    "Cache-Control": "private, max-age=3600",
+  });
+  createReadStream(abs).pipe(res);
 }
 
 function consoleLandingHtml(opts: {
@@ -95,6 +142,7 @@ function consoleLandingHtml(opts: {
       <p id="vault-status">Loading vault…</p>
       <ul>
         <li><code>GET /api/vault</code> — LoRA catalog + training packs</li>
+        <li><code>GET /api/lora-preview?id=…</code> — LoRA preview image</li>
         <li><code>GET /api/photomap</code> — PhotoMapAI health</li>
       </ul>
     </section>
@@ -209,6 +257,10 @@ export function startPanelConsoleHttpServer(opts: {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+      return;
+    }
+    if (req.method === "GET" && path === "/api/lora-preview") {
+      serveLoraPreview(req, res);
       return;
     }
     if (req.method === "GET" && path === "/api/photomap") {
