@@ -45,6 +45,7 @@ import { registerToolkitTools } from "./toolkit.js";
 import { registerRunComfyTools } from "./runcomfy.js";
 import { registerRunComfyTrainerTools } from "./runcomfy-trainer.js";
 import { registerPhotomapTools } from "./photomap.js";
+import { registerVaultTools } from "./vault.js";
 import { registerWorkflowPipelineTools } from "./workflow-pipeline.js";
 import { registerImageConvertTools } from "./image-convert.js";
 import { registerColorAnalysisTools } from "./color-analysis.js";
@@ -101,6 +102,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerUpdateComfyUITools],
   ["models", registerModelExtrasTools],
   ["models", registerLoraManagerTools],
+  ["images-assets", registerVaultTools],
   ["images-assets", registerConceptImageTools],
   ["models", registerExtraPathsTools],
   ["server", registerWorkspaceEnvTools],
