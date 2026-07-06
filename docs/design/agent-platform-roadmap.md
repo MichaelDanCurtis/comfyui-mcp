@@ -2,26 +2,27 @@
 
 Extend comfyui-mcp orchestrator + panel with multi-provider agents, cross-provider image sourcing, and autonomous infra management.
 
-## Phase 0 — Per-workflow agent (done in comfyui-mcp)
+## Phase 0 — Per-workflow agent
 
-- `WorkflowTargetStore` + `workflow_path` injection on graph commands
+- **Orchestrator (done):** `WorkflowTargetStore` + `workflow_path` injection on graph commands
 - MCP: `panel_get_workflow_target`, `panel_set_workflow_target`
 - Bridge: `set_workflow_target` / `workflow_target` sync
-- **Panel follow-up:** honor `workflow_path` in graph executors ([workflow-target.md](./workflow-target.md))
+- **Panel (done):** workspace picker UI; `getGraphCtx()` + most `graph_*` honor `workflow_path`; save/load/rename/close pinned workflows; clear errors for run/screenshot/subgraph while background-pinned ([workflow-target.md](./workflow-target.md))
 
-## Phase 0b — LoRA manager (orchestrator done)
+## Phase 0b — LoRA manager
 
-- Persistent catalog per instance: `lora-catalog.json` + `lora-previews/`
-- MCP: `lora_catalog_sync`, `lora_catalog_list`, `lora_catalog_get`, `lora_catalog_upsert`, `lora_catalog_set_preview`, `lora_catalog_search`
+- **Orchestrator (done):** persistent catalog per instance (`lora-catalog.json` + `lora-previews/`)
+- MCP: `lora_catalog_sync`, `lora_catalog_list`, `lora_catalog_get`, `lora_catalog_upsert`, `lora_catalog_set_preview`, `lora_catalog_search` (+ sidecar import / Civitai enrich)
 - Panel tools: `panel_open_lora_manager`, `panel_pick_lora` ([lora-manager.md](./lora-manager.md))
-- **Panel follow-up:** browse/pick UI with preview grid; implement `open_lora_manager` / `pick_lora` bridge handlers
+- **Panel (done):** browse/pick overlay with preview grid; `GET /api/lora-preview` on MCP console
+- **Optional later:** in-panel metadata edit → `lora_catalog_upsert`
 
-## Phase 1 — Grok backend (orchestrator done)
+## Phase 1 — Grok backend
 
-- `GrokBackend` implementing `AgentBackend` via `grok agent stdio` (ACP, OAuth at `~/.grok/auth.json`)
+- **Orchestrator (done):** `GrokBackend` via `grok agent stdio` (ACP, OAuth at `~/.grok/auth.json`)
 - `grok` in `BackendId`, readiness probe, single-port multi-provider wiring (`COMFYUI_MCP_GROK_MODEL`)
 - MCP parity: headless `comfyui` stdio + loopback `panel` HTTP (same as codex/gemini)
-- **Panel follow-up:** add Grok to the provider chip UI if not already present
+- **Panel (done):** Grok in provider chip UI (`PANEL_BACKEND_ORDER` / meta)
 
 ## Phase 2 — Cross-provider concept images (orchestrator done)
 
@@ -47,8 +48,12 @@ Extend comfyui-mcp orchestrator + panel with multi-provider agents, cross-provid
 - YAML project manifest (ordered stages, shared assets, chain_from between stages)
 - MCP tool: `run_workflow_pipeline` — per-stage pins, inputs, wait/timeout, dry_run ([workflow-pipeline.md](./workflow-pipeline.md))
 
+## Verification
+
+Morning UAT checklist: [agent-platform-morning-verification.md](./agent-platform-morning-verification.md)
+
 ## Notes
 
 - **Google AI Pro:** Gemini agent backend exists; image gen is a separate provider layer, not a new agent backend.
-- **Panel repo:** UI for workflow picker binds to `set_workflow_target`; graph executors must respect `workflow_path`.
+- **Panel repo:** UI for workflow picker binds to `set_workflow_target`; graph executors respect `workflow_path` (run-to-node still requires viewing the target tab).
 - **Do not replace comfyui-mcp-panel** — it remains the UI; this repo owns orchestration + MCP tools.
