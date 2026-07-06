@@ -48,6 +48,7 @@ import { GlmBackend, GLM_DEFAULT_MODEL } from "./glm-backend.js";
 import { KimiBackend, KIMI_DEFAULT_MODEL } from "./kimi-backend.js";
 import { allBackendReadiness } from "./backend-readiness.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
+import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
@@ -792,6 +793,23 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
   }
 
+  // Loopback MCP console (control plane): OAuth, MCP mappings, service lifecycle.
+  // Default port bridge+2 (9180→9182). Opened from the panel Advanced section.
+  let panelConsoleHttp: PanelConsoleHttpServer | null = null;
+  const consolePort = Number(process.env.COMFYUI_MCP_CONSOLE_PORT) || bridgePort + 2;
+  try {
+    panelConsoleHttp = await startPanelConsoleHttpServer({
+      port: consolePort,
+      bridgePort,
+      comfyuiUrl,
+    });
+  } catch (err) {
+    logger.warn(
+      `[panel-orchestrator] could not start MCP console on :${consolePort}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const consoleUrl = panelConsoleHttp?.url ?? `http://127.0.0.1:${consolePort}`;
+
   // Shared MCP server config for BOTH the Codex and Gemini backends — they take an
   // identical { transport } spec (the headless comfyui stdio MCP + the panel HTTP
   // MCP for this tab). Claude keeps its own in-process server set unchanged.
@@ -1189,7 +1207,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   function pushReadiness(tabId: string): void {
     try {
       const { backends, any_ready } = allBackendReadiness(KNOWN_BACKENDS);
-      bridge.push({ type: "backends", backends, any_ready }, tabId);
+      bridge.push({ type: "backends", backends, any_ready, console_url: consoleUrl }, tabId);
     } catch (err) {
       logger.warn(`[panel-orchestrator] readiness probe failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1692,7 +1710,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   downloadTimer.unref?.();
 
   logger.info(
-    `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${comfyuiPath ? `, path=${comfyuiPath}` : " — no COMFYUI_PATH, local install/pack tools limited"})`,
+    `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}, console on ${consoleUrl}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${comfyuiPath ? `, path=${comfyuiPath}` : " — no COMFYUI_PATH, local install/pack tools limited"})`,
   );
 
   let shuttingDown = false;
@@ -1710,6 +1728,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     // Tear down the loopback panel HTTP MCP (codex/gemini mode only).
     if (panelMcpHttp) await panelMcpHttp.stop().catch(() => {});
+    if (panelConsoleHttp) await panelConsoleHttp.stop().catch(() => {});
     secureBridge?.stop();
     await bridge.stop();
     // Only remove the lockfile if it still names us — avoid clobbering a fresh
