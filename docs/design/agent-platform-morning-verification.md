@@ -44,9 +44,14 @@ Use this after reloading ComfyUI (hard refresh the frontend) and restarting the 
 - [ ] **Run while pinned**: pin B, `panel_run` → agent gets a **clear error** (must switch tab or use Current workspace). This is expected — ComfyUI only queues the visible tab.
 - [ ] **Screenshot / enter subgraph while pinned** → clear error, no wrong canvas capture.
 
-### Known limitation (not a bug)
+### Background pinned reads (fixed — please confirm)
 
-- Pinning a workflow whose graph is **not exposed** on this ComfyUI build (`wf.graph` missing) still errors — use **Current workspace** or switch to that tab.
+- [ ] View tab **A**, pin workflow **B** (e.g. `MSue Edit-Polish`), ask agent for `panel_graph_outline` → succeeds with `pinned_background: true` (may show `serialized_only: true` on newer ComfyUI builds that only keep `activeState`, not `wf.graph`).
+- [ ] `panel_get_graph` / `panel_graph_find_nodes` on pinned background tab also work without switching your view.
+
+### Known limitation
+
+- `panel_run` while pinned to a background tab still errors (ComfyUI only queues the visible tab) — switch tab or use **Current workspace**.
 
 ---
 

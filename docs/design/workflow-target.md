@@ -40,6 +40,10 @@ Each graph executor should:
 
 Background edits on a non-active workflow should still persist and mark that tab modified.
 
+On ComfyUI builds that only attach a live `LGraph` to the **active** tab, the panel
+falls back to `changeTracker.activeState` for read tools and hydrates an off-canvas
+graph for edits (synced back via `changeTracker.activeState` on each mutating command).
+
 ## Files
 
 - `src/services/workflow-target-store.ts` — store + injection helper
