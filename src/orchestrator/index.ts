@@ -43,6 +43,9 @@ import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
 import { GrokBackend, GROK_DEFAULT_MODEL } from "./grok-backend.js";
 import { OllamaBackend } from "./ollama-backend.js";
+import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "./chatgpt-oauth-backend.js";
+import { GlmBackend, GLM_DEFAULT_MODEL } from "./glm-backend.js";
+import { KimiBackend, KIMI_DEFAULT_MODEL } from "./kimi-backend.js";
 import { allBackendReadiness } from "./backend-readiness.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
 import type { AgentBackend } from "./agent-backend.js";
@@ -651,6 +654,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   // performer (scripts/llm-arena.mjs): gemma4:e4b, 9/10 with the cleanest runs
   // (first-try tool dispatch, no nudges) and multimodal headroom for vision.
   const ollamaModel = process.env.COMFYUI_MCP_OLLAMA_MODEL ?? "gemma4:e4b";
+  const chatgptModel = process.env.COMFYUI_MCP_CHATGPT_MODEL ?? CHATGPT_DEFAULT_MODEL;
+  const glmModel = process.env.COMFYUI_MCP_GLM_MODEL ?? GLM_DEFAULT_MODEL;
+  const kimiModel = process.env.COMFYUI_MCP_KIMI_MODEL ?? KIMI_DEFAULT_MODEL;
   // The same backend also speaks any OpenAI-compatible endpoint (OpenRouter,
   // DeepSeek, vLLM, LM Studio): COMFYUI_MCP_OLLAMA_API=openai +
   // COMFYUI_MCP_OLLAMA_BASE_URL (incl. /v1) + COMFYUI_MCP_OLLAMA_API_KEY
@@ -672,7 +678,16 @@ export async function runPanelOrchestrator(): Promise<void> {
   // provider (the panel replays the transcript to seed it) while a same-provider
   // reconnect RESUMES. `backendId`/`codexModel`/`geminiModel` above are the
   // DEFAULT + per-provider model config; the process is no longer pinned to one.
-  const KNOWN_BACKENDS = new Set(["claude", "codex", "gemini", "grok", "ollama"]);
+  const KNOWN_BACKENDS = new Set([
+    "claude",
+    "codex",
+    "chatgpt",
+    "gemini",
+    "grok",
+    "glm",
+    "kimi",
+    "ollama",
+  ]);
   const defaultBackend = KNOWN_BACKENDS.has(backendId) ? backendId : "claude";
   const AGENT_KEY_SEP = "::";
   const tabBackends = new Map<string, string>(); // panel tabId -> selected backend
@@ -840,6 +855,33 @@ export async function runPanelOrchestrator(): Promise<void> {
         ...ollamaDeps(),
       });
     }
+    if (backend === "chatgpt") {
+      return new ChatGptOAuthBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: chatgptModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "glm") {
+      return new GlmBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: glmModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "kimi") {
+      return new KimiBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: kimiModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
     return undefined; // claude → built-in ClaudeBackend
   };
   logger.info(
@@ -859,11 +901,17 @@ export async function runPanelOrchestrator(): Promise<void> {
       pb =
         backend === "codex"
           ? new CodexBackend({ cwd: comfyuiPath ?? process.cwd(), model: codexModel })
-          : backend === "ollama"
-            ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: ollamaModel, ...ollamaDeps() })
-            : backend === "grok"
-              ? new GrokBackend({ cwd: comfyuiPath ?? process.cwd(), model: grokModel })
-              : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
+          : backend === "chatgpt"
+            ? new ChatGptOAuthBackend({ cwd: comfyuiPath ?? process.cwd(), model: chatgptModel })
+            : backend === "ollama"
+              ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: ollamaModel, ...ollamaDeps() })
+              : backend === "grok"
+                ? new GrokBackend({ cwd: comfyuiPath ?? process.cwd(), model: grokModel })
+                : backend === "glm"
+                  ? new GlmBackend({ cwd: comfyuiPath ?? process.cwd(), model: glmModel })
+                  : backend === "kimi"
+                    ? new KimiBackend({ cwd: comfyuiPath ?? process.cwd(), model: kimiModel })
+                    : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
       probeBackends.set(backend, pb);
     }
     return pb;
@@ -1081,6 +1129,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (backend === "gemini") return geminiModel;
     if (backend === "grok") return grokModel;
     if (backend === "ollama") return ollamaModel;
+    if (backend === "chatgpt") return chatgptModel;
+    if (backend === "glm") return glmModel;
+    if (backend === "kimi") return kimiModel;
     return model;
   }
   function pushModels(panelTabId: string): void {
@@ -1202,8 +1253,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (now - (lastAckAt.get(panelTab) ?? 0) < ACK_DEBOUNCE_MS) return;
       lastAckAt.set(panelTab, now);
       const isCx = backend === "codex";
+      const isCg = backend === "chatgpt";
       const isGm = backend === "gemini";
       const isGk = backend === "grok";
+      const isGl = backend === "glm";
+      const isKm = backend === "kimi";
       const isOl = backend === "ollama";
       // TRUTHFUL "connected": only claim ready after PROVING the SELECTED backend
       // can run, by probing its model list. If the probe fails — the "connected
@@ -1213,24 +1267,36 @@ export async function runPanelOrchestrator(): Promise<void> {
           if (models.length) {
             const agentLabel = isCx
               ? (codexModel ?? (models[0] as { value?: string }).value ?? "Codex")
-              : isGm
-                ? (geminiModel ?? (models[0] as { value?: string }).value ?? "Gemini")
-                : isGk
-                  ? (grokModel ?? (models[0] as { value?: string }).value ?? "Grok")
-                  : isOl
-                    ? (ollamaModel ?? (models[0] as { value?: string }).value ?? "Ollama")
-                    : model;
+              : isCg
+                ? (chatgptModel ?? (models[0] as { value?: string }).value ?? "ChatGPT")
+                : isGm
+                  ? (geminiModel ?? (models[0] as { value?: string }).value ?? "Gemini")
+                  : isGk
+                    ? (grokModel ?? (models[0] as { value?: string }).value ?? "Grok")
+                    : isGl
+                      ? (glmModel ?? (models[0] as { value?: string }).value ?? "GLM")
+                      : isKm
+                        ? (kimiModel ?? (models[0] as { value?: string }).value ?? "Kimi")
+                        : isOl
+                          ? (ollamaModel ?? (models[0] as { value?: string }).value ?? "Ollama")
+                          : model;
             // Greet only on a FRESH session (a resume/reconnect already has the thread).
             if (!resume) {
               const readyText = isCx
                 ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Codex (ChatGPT) account. Ask away.`
-                : isGm
-                  ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Google account (Gemini Code Assist). Ask away.`
-                  : isGk
-                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Grok (xAI) account. Ask away.`
-                    : isOl
-                      ? `🟢 comfyui-mcp agent ready — ${agentLabel} running locally via Ollama (no account, no API key). Small local models are slower and simpler than frontier ones — expect fewer frills. Ask away.`
-                      : `🟢 comfyui-mcp agent ready — ${agentLabel} on your Claude subscription. Ask away.`;
+                : isCg
+                  ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your ChatGPT subscription (direct OAuth). Ask away.`
+                  : isGm
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Google account (Gemini Code Assist). Ask away.`
+                    : isGk
+                      ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Grok (xAI) account. Ask away.`
+                      : isGl
+                        ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Z.AI GLM Coding Plan. Ask away.`
+                        : isKm
+                          ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Kimi Code subscription. Ask away.`
+                          : isOl
+                            ? `🟢 comfyui-mcp agent ready — ${agentLabel} running locally via Ollama (no account, no API key). Small local models are slower and simpler than frontier ones — expect fewer frills. Ask away.`
+                            : `🟢 comfyui-mcp agent ready — ${agentLabel} on your Claude subscription. Ask away.`;
               bridge.push({ type: "say", text: readyText }, panelTab);
             }
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
@@ -1238,13 +1304,19 @@ export async function runPanelOrchestrator(): Promise<void> {
           } else {
             const degradedText = isCx
               ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
-              : isGm
-                ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
-                : isGk
-                  ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
-                  : isOl
-                    ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull a tool-calling model (e.g. `ollama pull gemma4:e4b`), then Disconnect → Connect to retry."
-                    : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
+              : isCg
+                ? "⚠️ The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry."
+                : isGm
+                  ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
+                  : isGk
+                    ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
+                    : isGl
+                      ? "⚠️ The background agent isn't responding — GLM Code API couldn't start. Set ZAI_API_KEY (Z.AI Coding Plan), then Disconnect → Connect to retry."
+                      : isKm
+                        ? "⚠️ The background agent isn't responding — Kimi Code couldn't start. Run Kimi Code login (~/.kimi/credentials/kimi-code.json) or set KIMI_API_KEY, then Disconnect → Connect to retry."
+                        : isOl
+                          ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull a tool-calling model (e.g. `ollama pull gemma4:e4b`), then Disconnect → Connect to retry."
+                          : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
             bridge.push({ type: "say", text: degradedText }, panelTab);
             bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
             logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) but model probe empty — degraded ack`);

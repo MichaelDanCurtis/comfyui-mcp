@@ -43,6 +43,7 @@ import { registerLoraManagerTools } from "./lora-manager.js";
 import { registerConceptImageTools } from "./concept-image.js";
 import { registerToolkitTools } from "./toolkit.js";
 import { registerRunComfyTools } from "./runcomfy.js";
+import { registerRunComfyTrainerTools } from "./runcomfy-trainer.js";
 import { registerWorkflowPipelineTools } from "./workflow-pipeline.js";
 import { registerImageConvertTools } from "./image-convert.js";
 import { registerColorAnalysisTools } from "./color-analysis.js";
@@ -76,6 +77,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerProcessControlTools],
   ["server", registerToolkitTools],
   ["server", registerRunComfyTools],
+  ["server", registerRunComfyTrainerTools],
   ["images-assets", registerImageManagementTools],
   ["server", registerMemoryManagementTools],
   ["generation", registerGenerationTrackerTools],
