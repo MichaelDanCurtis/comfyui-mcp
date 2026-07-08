@@ -57,6 +57,11 @@ EXTRA_MODEL_PATHS="${EXTRA_MODEL_PATHS:-${COMFY_HOME}/extra_model_paths.yaml}"
 # Automatically a no-op for a PANEL_REF-pinned build (detached HEAD — pinning
 # means the user wants reproducibility, not drift). Set to 0 to disable outright.
 PANEL_AUTO_UPDATE="${PANEL_AUTO_UPDATE:-1}"
+# Where the §4.5(b.2) self-heal re-clones the Agent Panel from if the copy on the
+# volume is broken (0-byte/missing files). Baked as ENV by the Dockerfile;
+# PANEL_REF (optional tag/branch) keeps a ref-pinned build pinned through a heal.
+PANEL_REPO="${PANEL_REPO:-https://github.com/artokun/comfyui-mcp-panel.git}"
+PANEL_REF="${PANEL_REF:-}"
 
 # Volume user-data dirs (the ONLY things on /workspace).
 USER_DIR="${WORKSPACE}/user"
@@ -70,11 +75,12 @@ OUTPUT_DIR="${WORKSPACE}/output"
 LOG_DIR="${COMFY_LOG_DIR:-/var/log/comfyui-mcp}"
 mkdir -p "${LOG_DIR}"
 
-# Minimum host NVIDIA driver for this image. It ships the CUDA 13 stack (cu130
-# torch 2.9.1), and a Blackwell GPU (RTX 50xx / sm_120) additionally needs a
-# Blackwell-aware driver — CUDA 13.0 requires driver >= ~580. Override for a
-# different image/GPU, or set MIN_DRIVER=0 to disable the check.
-MIN_DRIVER="${MIN_DRIVER:-580}"
+# Minimum host NVIDIA driver. Baked per image variant by the Dockerfile
+# (MIN_DRIVER_DEFAULT env: 570 for the default cu128 build — the same CUDA 12.8
+# bar the runpod/pytorch base's container-start gate already enforces — 580 for
+# the cu130 perf variant, which needs CUDA 13). Override at runtime with
+# MIN_DRIVER, or set MIN_DRIVER=0 to disable the check.
+MIN_DRIVER="${MIN_DRIVER:-${MIN_DRIVER_DEFAULT:-570}}"
 
 # -----------------------------------------------------------------------------
 # 0. GPU DRIVER PREFLIGHT. The host NVIDIA driver is NOT upgradable from inside the
@@ -87,13 +93,13 @@ if [ "${MIN_DRIVER}" != "0" ] && command -v nvidia-smi >/dev/null 2>&1; then
   GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
   DRV="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
   DRV_MAJOR="${DRV%%.*}"
-  log "GPU: ${GPU_NAME:-unknown} | driver: ${DRV:-unknown} (this CUDA 13 image needs driver >= ${MIN_DRIVER})"
+  log "GPU: ${GPU_NAME:-unknown} | driver: ${DRV:-unknown} (this image needs driver >= ${MIN_DRIVER})"
   if [ -n "${DRV_MAJOR}" ] && [ "${DRV_MAJOR}" -lt "${MIN_DRIVER}" ] 2>/dev/null; then
     log "============================================================================"
     log "FATAL: host NVIDIA driver ${DRV} is TOO OLD for this image (needs >= ${MIN_DRIVER})."
     log "  Your ${GPU_NAME:-GPU} (esp. RTX 50xx / Blackwell) needs a newer driver, and the"
     log "  HOST driver CANNOT be upgraded from inside a pod — torch would fail to init CUDA."
-    log "  FIX: TERMINATE this pod and REDEPLOY on a host with CUDA >= 13 / driver >= ${MIN_DRIVER}"
+    log "  FIX: TERMINATE this pod and REDEPLOY on a host with driver >= ${MIN_DRIVER}"
     log "       (filter by 'CUDA Version' on the RunPod deploy screen). Verify with: nvidia-smi"
     log "  Holding the pod open (no crash-loop) so you can inspect it. Set MIN_DRIVER=0 to bypass."
     log "============================================================================"
@@ -112,6 +118,22 @@ fi
 #    guarantees Manager has a place to download into).
 #    NO caches, NO venv, NO custom_nodes are placed on the volume.
 # -----------------------------------------------------------------------------
+# Free-space preflight. A FULL volume is the nastiest failure mode on this pod:
+# every `cp`/`git checkout` still CREATES its files but writes 0 bytes into them
+# (ENOSPC), so the panel + custom nodes turn into a correct-looking tree of empty
+# husks that PERSISTS across redeploys. Detect it up front and say so in plain
+# words instead of letting the boot "succeed".
+free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+WS_FREE_MB="$(free_mb "${WORKSPACE}")"
+log "volume free space: ${WS_FREE_MB:-unknown} MB on ${WORKSPACE}"
+if [ -n "${WS_FREE_MB}" ] && [ "${WS_FREE_MB}" -lt 500 ] 2>/dev/null; then
+  log "============================================================================"
+  log "WARNING: ${WORKSPACE} has only ${WS_FREE_MB} MB free. Writes will fail with"
+  log "  ENOSPC and leave 0-BYTE files (empty panel, broken custom nodes, failed"
+  log "  model downloads). Free up space or grow the network volume, then restart."
+  log "============================================================================"
+fi
+
 log "preparing /workspace user-data dirs (mkdir -p; no sync)…"
 mkdir -p "${USER_DIR}" "${INPUT_DIR}" "${OUTPUT_DIR}"
 for sub in checkpoints configs loras vae text_encoders clip diffusion_models \
@@ -130,10 +152,20 @@ done
 # -----------------------------------------------------------------------------
 if [ ! -f "${MODELS_DIR}/checkpoints/sd_xl_base_1.0.safetensors" ] \
    && ls "${SEED_MODELS}"/*.safetensors >/dev/null 2>&1; then
-  log "first boot: copying baked spotcheck model(s) into models/checkpoints…"
-  cp -n "${SEED_MODELS}"/*.safetensors "${MODELS_DIR}/checkpoints/" \
-    && log "spotcheck model in place." \
-    || log "WARN: spotcheck copy failed (continuing)."
+  # Guard: the copy is ~7 GB. On a small/nearly-full volume it fills the disk and
+  # everything AFTER it (panel seed, node installs) degrades into 0-byte files.
+  # The spotcheck model is a convenience — skip it rather than poison the volume.
+  SEED_MODELS_MB="$(du -sm "${SEED_MODELS}" 2>/dev/null | awk '{print $1}')"
+  WS_FREE_MB="$(free_mb "${WORKSPACE}")"
+  if [ -n "${WS_FREE_MB}" ] && [ -n "${SEED_MODELS_MB}" ] \
+     && [ "${WS_FREE_MB}" -lt "$((SEED_MODELS_MB + 2048))" ] 2>/dev/null; then
+    log "SKIP spotcheck model: needs ~${SEED_MODELS_MB} MB (+2 GB headroom) but only ${WS_FREE_MB} MB free on ${WORKSPACE}."
+  else
+    log "first boot: copying baked spotcheck model(s) into models/checkpoints…"
+    cp -n "${SEED_MODELS}"/*.safetensors "${MODELS_DIR}/checkpoints/" \
+      && log "spotcheck model in place." \
+      || log "WARN: spotcheck copy failed (continuing)."
+  fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -174,6 +206,47 @@ write_manager_config() {  # $1 = config.ini absolute path
 write_manager_config "${USER_DIR}/__manager/config.ini"
 write_manager_config "${USER_DIR}/default/ComfyUI-Manager/config.ini"
 log "Manager config asserted: network_mode=${COMFY_NETWORK_MODE} security_level=${COMFY_SECURITY_LEVEL}"
+
+# -----------------------------------------------------------------------------
+# 3.5 Manager AUTO-UPDATE (honors the template's COMFY_AUTOUPDATE_MANAGER env,
+#     which existed on the template for ages but was silently ignored). The
+#     venv is EPHEMERAL by design, so any Manager fix applied inside a running
+#     pod (e.g. "update to nightly" to cure a broken install path) EVAPORATES
+#     on the next stop/start — this is the only runtime-persistent channel for
+#     Manager fixes short of shipping a new image.
+#       COMFY_AUTOUPDATE_MANAGER=1        (default) latest STABLE pip release
+#       COMFY_AUTOUPDATE_MANAGER=nightly  ComfyUI-Manager git main (bleeding edge)
+#       COMFY_AUTOUPDATE_MANAGER=0        keep the version baked in the image
+#     Best-effort with a hard timeout — an offline pod or a PyPI hiccup must
+#     never block boot. The baked manager_core shim is a SEPARATE site-packages
+#     module, so upgrades leave it in place (it goes inert if a future Manager
+#     drops the legacy import).
+# -----------------------------------------------------------------------------
+COMFY_AUTOUPDATE_MANAGER="${COMFY_AUTOUPDATE_MANAGER:-1}"
+MGR_PIP="${COMFY_HOME}/venv/bin/pip"
+MGR_PY="${COMFY_HOME}/venv/bin/python"
+mgr_ver() { "${MGR_PY}" -c "import importlib.metadata as m; print(m.version('comfyui-manager'))" 2>/dev/null || echo unknown; }
+if [ -x "${MGR_PIP}" ] && [ "${COMFY_AUTOUPDATE_MANAGER}" != "0" ]; then
+  MGR_BEFORE="$(mgr_ver)"
+  case "${COMFY_AUTOUPDATE_MANAGER}" in
+    nightly) MGR_SPEC="git+https://github.com/Comfy-Org/ComfyUI-Manager.git@main" ;;
+    *)       MGR_SPEC="comfyui_manager" ;;
+  esac
+  if timeout 180 "${MGR_PIP}" install -q -U --retries 2 "${MGR_SPEC}" \
+       >>"${LOG_DIR}/manager-update.log" 2>&1; then
+    MGR_AFTER="$(mgr_ver)"
+    if [ "${MGR_BEFORE}" = "${MGR_AFTER}" ]; then
+      log "Manager up to date: ${MGR_AFTER} (COMFY_AUTOUPDATE_MANAGER=${COMFY_AUTOUPDATE_MANAGER})"
+    else
+      log "Manager auto-updated: ${MGR_BEFORE} -> ${MGR_AFTER} (COMFY_AUTOUPDATE_MANAGER=${COMFY_AUTOUPDATE_MANAGER})"
+    fi
+  else
+    log "WARN: Manager auto-update failed/timed out — keeping baked $(mgr_ver) (see manager-update.log)"
+  fi
+else
+  [ "${COMFY_AUTOUPDATE_MANAGER}" = "0" ] \
+    && log "Manager auto-update disabled (COMFY_AUTOUPDATE_MANAGER=0) — baked $(mgr_ver)"
+fi
 
 # -----------------------------------------------------------------------------
 # 4. Ancillary services (best-effort — skipped if the binary is absent).
@@ -237,6 +310,101 @@ export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_TOKEN:-}}"
 [ -n "${HF_TOKEN}" ] && log "HF_TOKEN present — gated HuggingFace downloads authenticated."
 
 # -----------------------------------------------------------------------------
+# 4.4 FAST DOWNLOADS — two independent paths:
+#     (a) huggingface_hub fetches (custom nodes, ComfyUI internals): hf_transfer
+#         (Rust, parallel) + xet high-performance mode, DEFAULT ON for pod use
+#         (datacenter pipe, no proxies) — set either var to 0 on the pod to opt
+#         out (that is also the first troubleshooting step for a failing HF
+#         download: hf_transfer trades resume robustness for speed).
+#     (b) Manager install-model: an aria2 RPC sidecar. Manager's built-in
+#         downloader (single stream, tiny chunks) collapses to <1-4 MB/s
+#         against the MooseFS network volume, wedging the serial install queue
+#         for hours per model; with COMFYUI_MANAGER_ARIA2_SERVER set, Manager
+#         hands downloads to local aria2 instead (multi-connection → full pipe
+#         speed; the same pod measured 792 kB/s built-in vs 15-80 MB/s for
+#         aria2-class fetches). Set ARIA2_DISABLE=1 to opt out.
+#     GUARDS (review findings, 2026-07-08):
+#       - the flag/env is only set when the matching package imports — both the
+#         hub (HF_HUB_ENABLE_HF_TRANSFER) and Manager (import aria2p at startup
+#         when COMFYUI_MANAGER_ARIA2_SERVER is set) RAISE/CRASH otherwise;
+#       - aria2 runs under a respawn loop (a --daemon'd process that crashes
+#         mid-session would leave Manager hard-failing with NO fallback);
+#       - the Manager env is exported ONLY after a real RPC answer (daemonizing
+#         successfully says nothing about the listener being ready);
+#       - /models → volume symlink: Manager's aria2 path joins RELATIVE model
+#         dirs onto '/models' (container-ephemeral!) — the symlink turns that
+#         silent-loss edge case into a persistent write;
+#       - the RPC secret lives in a 600 conf file (not the process cmdline) and
+#         is length-checked (an empty --rpc-secret must never ship).
+# -----------------------------------------------------------------------------
+if "${COMFY_HOME}/venv/bin/python" -c "import hf_transfer" >/dev/null 2>&1; then
+  export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+  export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+  log "HF fast downloads: HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER} HF_XET_HIGH_PERFORMANCE=${HF_XET_HIGH_PERFORMANCE} (set 0 on the pod to opt out)"
+else
+  log "hf_transfer not importable — HF hub downloads use the default backend"
+fi
+
+ARIA2_RPC_PORT="${ARIA2_RPC_PORT:-6800}"
+RUNSTATE_DIR=/var/lib/comfyui-mcp
+if [ "${ARIA2_DISABLE:-0}" = "1" ]; then
+  log "aria2 sidecar disabled (ARIA2_DISABLE=1) — Manager uses its built-in downloader"
+elif command -v aria2c >/dev/null 2>&1 \
+     && "${COMFY_HOME}/venv/bin/python" -c "import aria2p" >/dev/null 2>&1; then
+  ARIA2_RPC_SECRET="${ARIA2_RPC_SECRET:-$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')}"
+  if [ "${#ARIA2_RPC_SECRET}" -lt 8 ]; then
+    log "WARN: could not generate an aria2 RPC secret — sidecar skipped (built-in downloader)"
+  else
+    mkdir -p "${RUNSTATE_DIR}"
+    ARIA2_CONF="${RUNSTATE_DIR}/aria2.conf"
+    ( umask 077; printf 'rpc-secret=%s\n' "${ARIA2_RPC_SECRET}" > "${ARIA2_CONF}" )
+    # /models guard — see GUARDS above. ln, not mkdir: an existing real /models
+    # (never shipped by this image) is left alone.
+    [ -e /models ] || ln -s "${MODELS_DIR}" /models 2>/dev/null \
+      || log "WARN: could not link /models -> ${MODELS_DIR}"
+    (
+      while :; do
+        aria2c --conf-path="${ARIA2_CONF}" --enable-rpc --rpc-listen-all=false \
+          --rpc-listen-port="${ARIA2_RPC_PORT}" \
+          --max-connection-per-server=16 --split=16 --min-split-size=8M \
+          --file-allocation=none --continue=true \
+          --allow-overwrite=true --auto-file-renaming=false \
+          --console-log-level=warn >>"${LOG_DIR}/aria2.log" 2>&1
+        echo "[comfyui-mcp/post_start] aria2c exited (rc=$?) — restarting in 3s" >>"${LOG_DIR}/aria2.log"
+        sleep 3
+      done
+    ) &
+    ARIA2_SUPERVISOR_PID=$!
+    ARIA2_READY=0
+    for _ in $(seq 1 40); do
+      if curl -s -m 2 "http://127.0.0.1:${ARIA2_RPC_PORT}/jsonrpc" \
+           -H 'Content-Type: application/json' \
+           -d "{\"jsonrpc\":\"2.0\",\"id\":\"boot\",\"method\":\"aria2.getVersion\",\"params\":[\"token:${ARIA2_RPC_SECRET}\"]}" \
+           2>/dev/null | grep -q '"result"'; then
+        ARIA2_READY=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ "${ARIA2_READY}" = "1" ]; then
+      export COMFYUI_MANAGER_ARIA2_SERVER="http://127.0.0.1:${ARIA2_RPC_PORT}"
+      export COMFYUI_MANAGER_ARIA2_SECRET="${ARIA2_RPC_SECRET}"
+      # Root-only state file so the boot test (and a debugging human) can make a
+      # REAL RPC call with the live secret instead of trusting a log line.
+      ( umask 077; printf 'COMFYUI_MANAGER_ARIA2_SERVER=%s\nCOMFYUI_MANAGER_ARIA2_SECRET=%s\n' \
+          "${COMFYUI_MANAGER_ARIA2_SERVER}" "${ARIA2_RPC_SECRET}" > "${RUNSTATE_DIR}/aria2-rpc.env" )
+      log "aria2 RPC sidecar up (127.0.0.1:${ARIA2_RPC_PORT}, RPC-verified, supervised) — Manager model downloads now multi-connection"
+    else
+      kill "${ARIA2_SUPERVISOR_PID}" 2>/dev/null || true
+      pkill -x aria2c 2>/dev/null || true
+      log "WARN: aria2 RPC did not answer within 20s — sidecar disabled, Manager falls back to its built-in downloader"
+    fi
+  fi
+else
+  log "aria2c/aria2p not baked in this image — Manager uses its built-in downloader"
+fi
+
+# -----------------------------------------------------------------------------
 # 4.5 CUSTOM NODES → the VOLUME (so runtime-installed nodes SURVIVE a restart).
 #     The base ComfyUI + venv stay in the image (fast boot), but custom_nodes live
 #     on /workspace — the #1 user complaint with a pure image-baked custom_nodes
@@ -269,11 +437,17 @@ fi
 
 # (b) Seed/refresh the baked nodes (panel + builtins) onto the volume. cp -rf
 #     overwrites the image-owned copies (keeps them current on an image upgrade)
-#     but never deletes the user's OWN nodes already on the volume.
+#     but never deletes the user's OWN nodes already on the volume. Errors go to
+#     a LOG, not /dev/null — a swallowed ENOSPC here once shipped a panel whose
+#     every file existed with 0 bytes, and nothing in the console said why.
 if [ -d "${CN_SEED}" ]; then
-  cp -rf "${CN_SEED}/." "${CN_VOL}/" 2>/dev/null \
-    && log "seeded/refreshed baked custom_nodes (panel + builtins) onto the volume" \
-    || log "WARN: custom_nodes seed refresh had errors (continuing)"
+  if cp -rf "${CN_SEED}/." "${CN_VOL}/" 2>>"${LOG_DIR}/custom-nodes-seed.log"; then
+    log "seeded/refreshed baked custom_nodes (panel + builtins) onto the volume"
+  else
+    log "WARN: custom_nodes seed refresh had errors — first lines:"
+    head -3 "${LOG_DIR}/custom-nodes-seed.log" 2>/dev/null | while IFS= read -r l; do log "  cp: ${l}"; done
+    log "  (full log: ${LOG_DIR}/custom-nodes-seed.log; free space: $(free_mb "${WORKSPACE}") MB)"
+  fi
 fi
 
 # (b.1) PANEL AUTO-UPDATE — decouples "get the latest Agent Panel" from "wait for
@@ -307,6 +481,45 @@ if [ "${PANEL_AUTO_UPDATE}" = "1" ] && [ -d "${PANEL_DIR}/.git" ]; then
   fi
 elif [ "${PANEL_AUTO_UPDATE}" != "1" ]; then
   log "Agent Panel auto-update disabled (PANEL_AUTO_UPDATE=${PANEL_AUTO_UPDATE})"
+fi
+
+# (b.2) PANEL INTEGRITY CHECK + SELF-HEAL. A past ENOSPC (or any interrupted
+#     copy) can leave the panel on the volume as a full file tree of 0-BYTE
+#     files — ComfyUI then lists the node but the panel tab never loads, and
+#     because the volume PERSISTS, every later redeploy looks just as broken.
+#     Verify the three load-bearing files; on failure re-clone from scratch.
+panel_ok() {  # $1 = panel dir
+  [ -s "$1/__init__.py" ] && [ -s "$1/pyproject.toml" ] \
+    && [ -s "$1/web/js/comfyui-mcp-panel.js" ]
+}
+if ! panel_ok "${PANEL_DIR}"; then
+  log "Agent Panel on the volume is BROKEN (missing/0-byte files) — self-healing…"
+  rm -rf "${PANEL_DIR}"
+  if git clone --depth 1 ${PANEL_REF:+--branch "${PANEL_REF}"} "${PANEL_REPO}" "${PANEL_DIR}" \
+       >>"${LOG_DIR}/panel-update.log" 2>&1 && panel_ok "${PANEL_DIR}"; then
+    log "Agent Panel re-cloned OK: $(git -C "${PANEL_DIR}" rev-parse --short HEAD 2>/dev/null)"
+  elif [ -d "${CN_SEED}/comfyui-mcp-panel" ] \
+       && rm -rf "${PANEL_DIR}" \
+       && cp -rf "${CN_SEED}/comfyui-mcp-panel" "${PANEL_DIR}" 2>>"${LOG_DIR}/panel-update.log" \
+       && panel_ok "${PANEL_DIR}"; then
+    log "Agent Panel restored from the image seed (offline fallback)."
+  else
+    log "============================================================================"
+    log "ERROR: could not repair the Agent Panel on ${CN_VOL}. Most common cause: the"
+    log "  network volume is FULL ($(free_mb "${WORKSPACE}") MB free) — writes create"
+    log "  0-byte files. Free/grow the volume and restart the pod; the panel will"
+    log "  self-heal on the next boot. Details: ${LOG_DIR}/panel-update.log"
+    log "============================================================================"
+  fi
+fi
+
+# Zero-byte sweep across ALL nodes on the volume — the same ENOSPC event that
+# empties the panel empties user-installed nodes too. We can't safely re-clone
+# arbitrary nodes (unknown sources), but we CAN say exactly which are broken.
+BROKEN_NODES="$(find "${CN_VOL}" -mindepth 2 -maxdepth 2 -name '__init__.py' -size 0 2>/dev/null \
+  | sed 's|.*/custom_nodes/||; s|/__init__.py$||' | sort -u | tr '\n' ' ')"
+if [ -n "${BROKEN_NODES// /}" ]; then
+  log "WARN: custom nodes with 0-byte __init__.py (broken; reinstall via Manager): ${BROKEN_NODES}"
 fi
 
 # (c) Reinstall custom-node Python deps into the venv from the persistent cache.
@@ -361,12 +574,21 @@ mkdir -p "${COMFY_HOME}/user"
 # the whole UI ("won't render") even though curl (no Sec-Fetch headers) works.
 # --enable-cors-header swaps that middleware for the CORS one, letting the
 # proxied browser through.
-# PERF: --use-sage-attention (SageAttention 2.2, baked) + --enable-triton-backend
-# (comfy-kitchen Triton, available in the image). The RTX 5090 wants these on cu130.
-# Override via COMFY_EXTRA_ARGS / edit here to fall back to --use-pytorch-cross-attention.
+# PERF: attention backend PROBED, not assumed — the cu130 perf variant bakes
+# SageAttention 2.2 (+ triton backend) but the default cu128 build ships neither
+# (no linux cu128 wheels exist for this torch line). Passing --use-sage-attention
+# without the package would crash ComfyUI at startup, so import-check the venv
+# and pick the matching flags. Override either way via COMFY_EXTRA_ARGS.
+if "${COMFY_HOME}/venv/bin/python" -c "import sageattention" >/dev/null 2>&1; then
+  ATTN_ARGS=(--use-sage-attention --enable-triton-backend)
+  log "SageAttention baked in this image — launching with --use-sage-attention"
+else
+  ATTN_ARGS=(--use-pytorch-cross-attention)
+  log "no SageAttention in this image (cu128 broad-compat build) — using PyTorch cross-attention"
+fi
 ARGS=(--listen 0.0.0.0 --port "${COMFY_PORT}"
       --enable-manager --enable-cors-header
-      --use-sage-attention --enable-triton-backend
+      "${ATTN_ARGS[@]}"
       --user-directory  "${USER_DIR}"
       --input-directory "${INPUT_DIR}"
       --output-directory "${OUTPUT_DIR}")

@@ -573,6 +573,9 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `COMFYUI_HOST` | `127.0.0.1` | ComfyUI server address |
 | `COMFYUI_PORT` | *(auto-detect)* | ComfyUI server port (tries 8188, then 8000) |
 | `COMFYUI_PATH` | *(auto-detect)* | Path to ComfyUI data directory. Auto-detection suppressed in remote/cloud modes. |
+| `COMFYUI_PYTHON` | `python` | Python interpreter for cm-cli subprocess operations (`useCmCli`, `sync_node_dependencies`) — point it at your ComfyUI venv's python. cm-cli needs the local filesystem, so these are **local-mode only**; on remote targets use the Manager HTTP path (the default). |
+| `COMFYUI_MCP_BRIDGE_HOST` | `127.0.0.1` | Panel-bridge bind host. Set `0.0.0.0` (or a LAN IP) to run the orchestrator on a 24/7 server and connect panels from other machines — **requires a token** (below); the orchestrator prints a ready-to-paste `ws://…/?token=…` Bridge URL. |
+| `COMFYUI_MCP_BRIDGE_TOKEN` | *(generated when needed)* | Shared secret gating every bridge connection (checked constant-time on the WS upgrade). Mandatory for a non-loopback `COMFYUI_MCP_BRIDGE_HOST`; pin it so the Bridge URL survives restarts. Never logged beyond the startup banner. |
 | `COMFYUI_MCP_DATA_DIR` | `~/.comfyui-mcp` | Base dir for per-instance data (the `generations.db` used by `suggest_settings`) when there's no local `COMFYUI_PATH` (remote/cloud/undetected). Scoped per target under `instances/<host_port>/`. |
 | `COMFYUI_API_KEY` | | Comfy Cloud API key. When set, **cloud mode** is active and the server talks to `cloud.comfy.org`. Never logged. |
 | `COMFYUI_CLOUD_URL` | `https://cloud.comfy.org` | Override the Comfy Cloud endpoint (testing/staging). |
@@ -633,8 +636,47 @@ generate but can't see its own outputs.
 For small/local models, **compact tool mode** (`--compact` /
 `COMFYUI_MCP_TOOL_MODE=compact`) registers 3 meta-tools
 (`list_tools` → `describe_tool` → `call_tool`) instead of the full ~200-schema
-surface, pulling schemas into context one tool at a time. Validated
-end-to-end via Ollama with `gemma4:e4b`, `gemma4:e2b`, and `qwen3:4b`
+surface, pulling schemas into context one tool at a time. **Run it locally
+for free with our fine-tuned models**: `ollama pull artokun/gemma4-comfyui-mcp:e4b`
+(also `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB) — Gemma 4 QLoRA-trained on 1,055
+server-verified trajectories over the full comfyui-mcp tool surface, and the
+panel's Ollama default. Stock `gemma4:*`/`qwen3:4b` also validated end-to-end
+(`npm run test:local-llm`); gemma3 has no native tool calling and is
+unsupported. Full guide — hosted-model guidance (DeepSeek/MiMo/GLM class),
+per-harness setup, troubleshooting:
+**[Local LLMs & other agents](https://comfyui-mcp.artokun.io/docs/local-llms)**.
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `setup <agent>` | | | Write the comfyui entry into hermes / openclaw / copilot config, then exit |
+| `--compact` / `--tool-mode compact` | `COMFYUI_MCP_TOOL_MODE=compact` | `full` | Register 3 meta-tools instead of the full ~200-schema surface |
+
+### Other agents & local LLMs (Hermes, OpenClaw, Copilot CLI, Ollama)
+
+comfyui-mcp has **first-class support for non-Claude harnesses**. One command
+writes the server entry into the harness's own config (merging, not
+clobbering):
+
+```bash
+npx -y comfyui-mcp setup hermes     # → ~/.hermes/config.yaml      (compact by default)
+npx -y comfyui-mcp setup openclaw   # → ~/.openclaw/openclaw.json  (compact by default)
+npx -y comfyui-mcp setup copilot    # → ~/.copilot/mcp-config.json (full by default)
+# flags: --compact | --full, --comfyui-url <url>, --dry-run
+```
+
+**Model requirements**: tool calling is a hard requirement (no tool calling =
+doesn't work). Thinking and vision are strongly recommended — without
+thinking, multi-step tool chains degrade; without vision the agent can
+generate but can't see its own outputs.
+
+For small/local models, **compact tool mode** (`--compact` /
+`COMFYUI_MCP_TOOL_MODE=compact`) registers 3 meta-tools
+(`list_tools` → `describe_tool` → `call_tool`) instead of the full ~200-schema
+surface, pulling schemas into context one tool at a time. **Run it locally
+for free with our fine-tuned models**: `ollama pull artokun/gemma4-comfyui-mcp:e4b`
+(also `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB) — Gemma 4 QLoRA-trained on 1,055
+server-verified trajectories over the full comfyui-mcp tool surface, and the
+panel's Ollama default. Stock `gemma4:*`/`qwen3:4b` also validated end-to-end
 (`npm run test:local-llm`); gemma3 has no native tool calling and is
 unsupported. Full guide — hosted-model guidance (DeepSeek/MiMo/GLM class),
 per-harness setup, troubleshooting:

@@ -11,12 +11,12 @@
 
 import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { tmpdir, networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import readline from "node:readline";
-import { startUiBridge, type UiBridge } from "../services/ui-bridge.js";
+import { startUiBridge, isLoopbackBindHost, type UiBridge } from "../services/ui-bridge.js";
 import { setupSecureBridge, type SecureBridge } from "../services/secure-bridge.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { SessionStore } from "./session-store.js";
@@ -33,11 +33,14 @@ import {
 } from "./panel-agent.js";
 import { createPanelMcpServer } from "./panel-tools.js";
 import { readUserMcpServers } from "../services/user-mcp-config.js";
-import { isForceRemoteFlagSet, isLoopbackHost } from "../config.js";
+import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath } from "../config.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
   onComfyuiSecretsChanged,
+  hydrateAgentSecretsIntoEnv,
+  onAgentSecretsChanged,
+  setAgentSecret,
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
@@ -52,6 +55,7 @@ import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./pane
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
+import { getAgentSettings, setAgentSettings } from "../services/panel-settings.js";
 import {
   gatherEnvCapabilities,
   buildPanelSystemAppend,
@@ -269,6 +273,95 @@ interface OrchestratorLock {
   pid?: unknown;
   startedAt?: unknown;
   version?: unknown;
+  comfyuiUrl?: unknown;
+}
+
+/**
+ * Kill a process AND ITS TREE. A bare signal to the holder's pid leaves its
+ * children (cloudflared tunnel, spawned agent MCP subprocesses) alive — the
+ * field report "it doesn't fully terminate" (2026-07-08): Ctrl+C/kill of the
+ * node process orphaned cloudflared, and stale children kept state around.
+ * Windows: taskkill /T /F (tree + force). POSIX: best-effort children sweep
+ * (pkill -P) around the usual TERM → KILL escalation.
+ */
+function killProcessTreeCrossPlatform(pid: number, mode: "term" | "kill"): void {
+  if (process.platform === "win32") {
+    // No graceful tree-signal exists on Windows; /T /F is the reliable path.
+    execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  const sig = mode === "term" ? "SIGTERM" : "SIGKILL";
+  try {
+    execFileSync("pkill", [`-${sig.replace("SIG", "")}`, "-P", String(pid)], { stdio: "ignore" });
+  } catch {
+    // no children / pkill absent — the direct signal below still applies
+  }
+  process.kill(pid, sig);
+}
+
+/** Copy-paste "free this port" commands — LAST RESORT only (non-interactive
+ *  shells where we cannot prompt, or a kill that failed): the interactive path
+ *  resolves the owner from the port and kills it itself after consent. */
+function portKillHint(port: number): string {
+  const ps = `Get-NetTCPConnection -LocalPort ${port} -State Listen | % { taskkill /PID $_.OwningProcess /T /F }`;
+  const sh = `lsof -ti tcp:${port} -s tcp:listen | xargs -r kill -9`;
+  return process.platform === "win32"
+    ? `To free the port manually:\n  PowerShell:  ${ps}\n  bash/zsh:    ${sh}`
+    : `To free the port manually:\n  bash/zsh:    ${sh}\n  PowerShell:  ${ps}`;
+}
+
+/** Resolve which pid is LISTENING on a local TCP port (null if none/unknown). */
+function pidListeningOnPort(port: number): number | null {
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
+      for (const line of out.split(/\r?\n/)) {
+        const m = line.match(/TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
+        if (m && Number(m[1]) === port) return Number(m[2]);
+      }
+      return null;
+    }
+    const out = execFileSync("lsof", ["-ti", `tcp:${port}`, "-s", "tcp:LISTEN"], {
+      encoding: "utf8",
+    });
+    const pid = Number(out.trim().split(/\s+/)[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort executable name for a pid ("unknown" when unreadable). */
+function processNameOf(pid: number): string {
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+        encoding: "utf8",
+      });
+      return /^"([^"]+)"/m.exec(out)?.[1] ?? "unknown";
+    }
+    return (
+      execFileSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" }).trim() ||
+      "unknown"
+    );
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Can the target ComfyUI answer /system_stats within timeoutMs? */
+async function probeComfyUi(url: string, timeoutMs = 3000): Promise<boolean> {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    const res = await fetch(new URL("system_stats", url.endsWith("/") ? url : `${url}/`), {
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 function readOrchestratorLock(lockPath: string): OrchestratorLock | null {
@@ -315,49 +408,94 @@ async function tryReclaimBridgePort(
 ): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
   const lock = readOrchestratorLock(lockPath);
-  const pid = typeof lock?.pid === "number" ? lock.pid : NaN;
-  if (!Number.isInteger(pid) || pid <= 0 || !pidExists(pid)) return false;
+  const lockPid =
+    typeof lock?.pid === "number" && Number.isInteger(lock.pid) && lock.pid > 0 && pidExists(lock.pid)
+      ? lock.pid
+      : null;
+  // The lockfile can be stale/missing while SOMETHING still owns the port (a
+  // crashed session's orphaned child, an unrelated app). Resolve the actual
+  // listener from the port so a single consent can clear EVERYTHING.
+  const portPid = pidListeningOnPort(port);
+  const pid = lockPid ?? portPid;
+  if (!pid) return false;
 
-  const myVersion = detectInstallMode().currentVersion ?? "unknown";
-  const heldVersion = typeof lock?.version === "string" ? lock.version : "unknown";
-  const startedAt = typeof lock?.startedAt === "string" ? lock.startedAt : null;
-  const holderNote =
-    heldVersion !== "unknown" && myVersion !== "unknown" && heldVersion !== myVersion
-      ? `an older comfyui-mcp v${heldVersion} (this is v${myVersion})`
-      : `another comfyui-mcp v${heldVersion} session`;
+  const myUrl = process.env.COMFYUI_URL || "http://127.0.0.1:8188";
+  let holderNote: string;
+  let detailNote = "";
+  if (lockPid) {
+    const myVersion = detectInstallMode().currentVersion ?? "unknown";
+    const heldVersion = typeof lock?.version === "string" ? lock.version : "unknown";
+    const startedAt = typeof lock?.startedAt === "string" ? lock.startedAt : null;
+    holderNote =
+      heldVersion !== "unknown" && myVersion !== "unknown" && heldVersion !== myVersion
+        ? `an older comfyui-mcp v${heldVersion} (this is v${myVersion})`
+        : `another comfyui-mcp v${heldVersion} session`;
+    // Show WHICH ComfyUI each side is driving — the classic tangle is a stale
+    // session recalled from shell history still "driving" a terminated pod
+    // while the user tries to connect to the live one; without the URLs both
+    // sessions look identical and the takeover choice is a coin flip.
+    const heldUrl = typeof lock?.comfyuiUrl === "string" ? lock.comfyuiUrl : null;
+    if (startedAt) detailNote += `, started ${startedAt}`;
+    if (heldUrl) {
+      const alive = await probeComfyUi(heldUrl);
+      detailNote += `, driving ${heldUrl}${alive ? "" : " (NOT RESPONDING — likely a terminated pod / stale session)"}`;
+    }
+  } else {
+    holderNote = `an unidentified process ("${processNameOf(pid)}" — no comfyui-mcp lockfile; likely an orphaned session or another app)`;
+  }
   logger.warn(
-    `[panel-orchestrator] port ${port} is already held by ${holderNote} — pid ${pid}` +
-      `${startedAt ? `, started ${startedAt}` : ""}.`,
+    `[panel-orchestrator] port ${port} is already held by ${holderNote} — pid ${pid}${detailNote}.`,
   );
   const ok = await promptYesNo(
-    `Stop pid ${pid} and take over this port with the current version? [y/N] `,
+    `Stop it (and its whole process tree) and take over port ${port} for ${myUrl}? [y/N] `,
   );
-  if (!ok) return false;
-
-  logger.info(`[panel-orchestrator] stopping pid ${pid} to reclaim port ${port}…`);
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch (err) {
-    logger.warn(
-      `[panel-orchestrator] couldn't signal pid ${pid}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  if (!ok) {
+    logger.info(`[panel-orchestrator] leaving pid ${pid} alone.\n${portKillHint(port)}`);
     return false;
   }
-  // Give it a moment to release the port; escalate to SIGKILL if it's still
-  // hanging around, then retry the bind once (bridge.start() runs its own
-  // EADDRINUSE backoff, covering the OS's brief port-release lag).
+
+  // One Y = full authority to clear the port: kill the lockfile's holder AND
+  // whatever is actually listening (they can differ when the lockfile is
+  // stale), whole trees, escalating to a hard kill for anything that survives.
+  const targets = [...new Set([lockPid, portPid].filter((p): p is number => p != null))];
+  logger.info(
+    `[panel-orchestrator] stopping pid${targets.length > 1 ? "s" : ""} ${targets.join(", ")} (and their process trees) to reclaim port ${port}…`,
+  );
+  for (const t of targets) {
+    try {
+      killProcessTreeCrossPlatform(t, "term");
+    } catch (err) {
+      logger.warn(
+        `[panel-orchestrator] couldn't stop pid ${t}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  // Give them a moment to release the port; escalate to a hard tree-kill for
+  // survivors, sweep any NEW listener that appeared (a respawned child), then
+  // retry the bind once (bridge.start() runs its own EADDRINUSE backoff,
+  // covering the OS's brief port-release lag).
   const deadline = Date.now() + 5000;
-  while (Date.now() < deadline && pidExists(pid)) {
+  while (Date.now() < deadline && targets.some((t) => pidExists(t))) {
     await new Promise((r) => setTimeout(r, 200));
   }
-  if (pidExists(pid)) {
+  for (const t of targets) {
+    if (!pidExists(t)) continue;
     try {
-      process.kill(pid, "SIGKILL");
+      killProcessTreeCrossPlatform(t, "kill");
     } catch {
       // already gone
     }
-    await new Promise((r) => setTimeout(r, 300));
   }
+  const straggler = pidListeningOnPort(port);
+  if (straggler && !targets.includes(straggler)) {
+    logger.warn(`[panel-orchestrator] a new pid ${straggler} grabbed port ${port} — stopping it too.`);
+    try {
+      killProcessTreeCrossPlatform(straggler, "kill");
+    } catch {
+      // best-effort
+    }
+  }
+  await new Promise((r) => setTimeout(r, 300));
   bridge.start();
   return bridge.whenReady();
 }
@@ -465,6 +603,17 @@ export async function runPanelOrchestrator(): Promise<void> {
   // claude.ai login, never an API key. Unset the key for the SDK subprocess.
   delete process.env.ANTHROPIC_API_KEY;
 
+  // First non-internal IPv4 — display-only, for the LAN-bridge banner when the
+  // bind host is 0.0.0.0/:: (the real reachable address depends on the network).
+  const firstLanIPv4 = (): string | undefined => {
+    for (const addrs of Object.values(networkInterfaces())) {
+      for (const a of addrs ?? []) {
+        if (!a.internal && a.family === "IPv4") return a.address;
+      }
+    }
+    return undefined;
+  };
+
   // Secure bridge: when driving a REMOTE https ComfyUI (a pod), the pod's HTTPS
   // panel page can't reach a plain ws:// loopback bridge (mixed-content / Private
   // Network Access), so auto-upgrade to a token-gated wss:// exposed via a
@@ -474,12 +623,49 @@ export async function runPanelOrchestrator(): Promise<void> {
     process.env.COMFYUI_MCP_INSECURE_BRIDGE === "1" ||
     process.env.COMFYUI_MCP_INSECURE_BRIDGE === "true";
   const wantSecureBridge = !insecureBridge && isRemoteHttpsUrl(process.env.COMFYUI_URL ?? "");
-  const bridgeToken = wantSecureBridge ? randomBytes(24).toString("hex") : null;
 
-  // Dedicated PANEL bridge port (default 9180). Token-gated only in secure mode.
+  // LAN bridge (panel #54 — the 24/7 server / standalone OpenClaw topology):
+  // COMFYUI_MCP_BRIDGE_HOST binds the bridge on a non-loopback interface so
+  // browsers on OTHER machines can connect. Non-loopback ALWAYS token-gates the
+  // WS upgrade — the token comes from COMFYUI_MCP_BRIDGE_TOKEN (pin it for
+  // stable reconnects across restarts) or is generated fresh and printed below.
+  const bridgeHost = (process.env.COMFYUI_MCP_BRIDGE_HOST ?? "127.0.0.1").trim() || "127.0.0.1";
+  const lanBridge = !isLoopbackBindHost(bridgeHost);
+  const envBridgeToken = process.env.COMFYUI_MCP_BRIDGE_TOKEN?.trim() || null;
+  const bridgeToken =
+    envBridgeToken ?? (wantSecureBridge || lanBridge ? randomBytes(24).toString("hex") : null);
+
+  // Dedicated PANEL bridge port (default 9180). Token-gated in secure/LAN mode.
   const lockPort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
   const lockPath = orchLockPath(lockPort);
-  const bridge = startUiBridge(lockPort, bridgeToken);
+  const bridge = startUiBridge(lockPort, bridgeToken, bridgeHost);
+
+  if (lanBridge) {
+    // Ready-to-paste connection info: the panel's Settings → Advanced →
+    // Bridge URL takes the full URL incl. ?token= verbatim.
+    const displayHost =
+      bridgeHost === "0.0.0.0" || bridgeHost === "::"
+        ? (firstLanIPv4() ?? "<this-machine-ip>")
+        : bridgeHost;
+    process.stderr.write(
+      [
+        "",
+        "════════════════════════════════════════════════════════════════════",
+        " ComfyUI MCP — panel bridge exposed on the LAN (token-gated)",
+        "════════════════════════════════════════════════════════════════════",
+        ` Bridge URL : ws://${displayHost}:${lockPort}/?token=${bridgeToken}`,
+        "",
+        " In the panel: Settings → Advanced → Bridge URL → paste the URL above,",
+        " then click Connect. Anyone with this URL can drive the agent — treat",
+        " it like a password.",
+        envBridgeToken
+          ? " Token source: COMFYUI_MCP_BRIDGE_TOKEN (stable across restarts)."
+          : " Token was GENERATED for this run — set COMFYUI_MCP_BRIDGE_TOKEN to keep the same URL across restarts.",
+        "════════════════════════════════════════════════════════════════════",
+        "",
+      ].join("\n") + "\n",
+    );
+  }
 
   // Owning the bridge port is the orchestrator's whole job — if another process
   // holds it, fail loudly instead of running uselessly. (This also avoids the
@@ -491,7 +677,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   if (!bound) bound = await tryReclaimBridgePort(bridge, lockPort, lockPath);
   if (!bound) {
     logger.error(
-      `[panel-orchestrator] could not bind the panel bridge port — another process owns it. Free that port and restart the orchestrator. Override the port with COMFYUI_MCP_BRIDGE_PORT.`,
+      `[panel-orchestrator] could not bind the panel bridge port — another process owns it. Free that port and restart the orchestrator. Override the port with COMFYUI_MCP_BRIDGE_PORT.\n${portKillHint(lockPort)}`,
     );
     process.exit(1);
   }
@@ -523,6 +709,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         // npm package version — read by a NEXT orchestrator's tryReclaimBridgePort
         // to tell the user whose/which version currently holds the port.
         version: detectInstallMode().currentVersion ?? null,
+        // The ComfyUI this session drives — shown by a NEXT orchestrator's
+        // takeover prompt so a stale session (dead pod URL from shell history)
+        // identifies itself instead of looking like a twin.
+        comfyuiUrl: process.env.COMFYUI_URL || null,
       }),
     );
   } catch (err) {
@@ -539,12 +729,37 @@ export async function runPanelOrchestrator(): Promise<void> {
   // whatever ComfyUI (local or a RunPod proxy) the browser is actually on. No
   // `connect <url>` needed.
   let comfyuiUrl = process.env.COMFYUI_URL ?? "http://127.0.0.1:8188";
+  // Dead-target guard: a `connect` aimed at a TERMINATED pod (an old URL
+  // recalled from shell history) otherwise looks perfectly alive — bridge up,
+  // tunnel up — while its advertise goes to a dead host, so the panel never
+  // receives this session's token and spams "missing/invalid token". Name the
+  // real problem up front. Warn-only and fire-and-forget: the target may
+  // legitimately still be booting, and a panel `hello` can retarget us later.
+  void (async () => {
+    const target = comfyuiUrl;
+    if (await probeComfyUi(target, 6000)) return;
+    logger.warn(
+      `[panel-orchestrator] the target ComfyUI at ${target} is NOT responding. ` +
+        `If it is a pod that is still starting, this resolves itself — but if the pod was ` +
+        `TERMINATED, this is a stale URL (shell history?) and the panel will never be able to ` +
+        `connect to this session (it shows up as 'missing/invalid token' rejections). ` +
+        `Double-check the pod id in the URL and re-run connect with the current one.`,
+    );
+  })();
   // ComfyUI install path — when set AND the target is loopback, the spawned agent's
   // MCP runs in LOCAL mode (download_model / apply_manifest / installer-pack /
   // model-scan tools). A REMOTE target (non-loopback) forces remote-only, so we
   // drop the path. `envComfyuiPath` is the orchestrator's own env value; the live
   // `comfyuiPath` is derived from it + the current target.
+  // env > auto-detected. The detection (Desktop-recorded installs first, then
+  // common directories) is the same one the headless MCP's config uses — the
+  // orchestrator previously read ONLY the env var, so a Desktop user without
+  // COMFYUI_PATH always landed in "local install/pack tools limited" even with
+  // a local install the MCP itself could find.
   const envComfyuiPath = process.env.COMFYUI_PATH;
+  // `||` not `??`: a set-but-empty COMFYUI_PATH= means "unset" (the headless
+  // MCP's config truthy-checks it the same way) — it must not block detection.
+  const localComfyuiPath = envComfyuiPath || detectLocalComfyUIPath();
   const isLoopbackUrl = (u: string): boolean => {
     try {
       return isLoopbackHost(new URL(u).hostname);
@@ -552,7 +767,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       return true;
     }
   };
-  let comfyuiPath = isLoopbackUrl(comfyuiUrl) ? envComfyuiPath : undefined;
+  // --force-remote drops the local path too: a loopback URL that is really a
+  // port-forward to a pod (e.g. RunPod/dstack) must not hand spawned agents a
+  // local install — the spawn env builders prefer COMFYUI_PATH over the
+  // force-remote flag, so a leaked path would silently defeat --force-remote.
+  const localPathForTarget = (url: string): string | undefined =>
+    !isForceRemoteFlagSet() && isLoopbackUrl(url) ? localComfyuiPath : undefined;
+  let comfyuiPath = localPathForTarget(comfyuiUrl);
   // Force the child remote only when opted in (--force-remote) or the target is
   // non-loopback; a default loopback panel user with no COMFYUI_PATH is left to
   // auto-detect its local install (keeps download_model/apply_manifest/scans).
@@ -650,11 +871,27 @@ export async function runPanelOrchestrator(): Promise<void> {
   // via the CLI `--model` flag (ACP exposes no per-session model setter).
   const geminiModel = process.env.COMFYUI_MCP_GEMINI_MODEL ?? GEMINI_DEFAULT_MODEL;
   const grokModel = process.env.COMFYUI_MCP_GROK_MODEL ?? GROK_DEFAULT_MODEL;
-  // Ollama (local LLMs, issue #97): the model is a local tag (qwen3:4b, gemma4:e4b)
-  // applied PER REQUEST — switching live is free. Default = the LLM Arena's best
-  // performer (scripts/llm-arena.mjs): gemma4:e4b, 9/10 with the cleanest runs
-  // (first-try tool dispatch, no nudges) and multimodal headroom for vision.
-  const ollamaModel = process.env.COMFYUI_MCP_OLLAMA_MODEL ?? "gemma4:e4b";
+  // Ollama (local LLMs, issue #97): the model is a local tag applied PER
+  // REQUEST — switching live is free. Default = OUR FINE-TUNE,
+  // artokun/gemma4-comfyui-mcp:e4b — gemma4 QLoRA-trained on 1055
+  // server-verified comfyui-mcp trajectories over the full 178-tool surface
+  // (hf.co/artokun/gemma4-comfyui-mcp), so it drives this exact tool suite
+  // natively. Supersedes stock gemma4:e4b (the previous arena best, 9/10).
+  // Ladder by VRAM at q4: :e2b ~2 GB / :e4b ~3.5 GB / :12b ~8 GB.
+  //
+  // Config precedence: env (escape hatch, always wins) → persisted user settings
+  // (~/.comfyui-mcp/panel-settings.json, edited from the panel Settings dialog
+  // via set_config) → built-in default. Mutable (`let`) because set_config can
+  // retarget them live; API keys stay env-only and never touch the settings file.
+  // Copy any panel-stored provider keys (OPENROUTER_API_KEY) into env BEFORE we
+  // read them below, so a key set on a prior run enables its provider on boot.
+  const hydratedSecrets = hydrateAgentSecretsIntoEnv();
+  if (hydratedSecrets.length) {
+    logger.info(`[panel-orchestrator] hydrated agent secrets from store: ${hydratedSecrets.join(", ")}`);
+  }
+  const persistedAgent = getAgentSettings();
+  let ollamaModel =
+    process.env.COMFYUI_MCP_OLLAMA_MODEL ?? persistedAgent.ollama?.model ?? "artokun/gemma4-comfyui-mcp:e4b";
   const chatgptModel = process.env.COMFYUI_MCP_CHATGPT_MODEL ?? CHATGPT_DEFAULT_MODEL;
   const glmModel = process.env.COMFYUI_MCP_GLM_MODEL ?? GLM_DEFAULT_MODEL;
   const kimiModel = process.env.COMFYUI_MCP_KIMI_MODEL ?? KIMI_DEFAULT_MODEL;
@@ -662,14 +899,38 @@ export async function runPanelOrchestrator(): Promise<void> {
   // DeepSeek, vLLM, LM Studio): COMFYUI_MCP_OLLAMA_API=openai +
   // COMFYUI_MCP_OLLAMA_BASE_URL (incl. /v1) + COMFYUI_MCP_OLLAMA_API_KEY
   // (falls back to OPENROUTER_API_KEY). The chip stays "Ollama (local)".
-  const ollamaApi = process.env.COMFYUI_MCP_OLLAMA_API === "openai" ? ("openai" as const) : ("ollama" as const);
-  const ollamaBaseUrl = process.env.COMFYUI_MCP_OLLAMA_BASE_URL;
+  let ollamaApi: "openai" | "ollama" =
+    (process.env.COMFYUI_MCP_OLLAMA_API
+      ? process.env.COMFYUI_MCP_OLLAMA_API === "openai"
+      : persistedAgent.ollama?.api === "openai")
+      ? "openai"
+      : "ollama";
+  let ollamaBaseUrl = process.env.COMFYUI_MCP_OLLAMA_BASE_URL ?? persistedAgent.ollama?.baseUrl;
   const ollamaApiKey = process.env.COMFYUI_MCP_OLLAMA_API_KEY || process.env.OPENROUTER_API_KEY;
   const ollamaDeps = () => ({
     api: ollamaApi,
     ...(ollamaBaseUrl ? { host: ollamaBaseUrl } : {}),
     ...(ollamaApi === "openai" && ollamaApiKey ? { apiKey: ollamaApiKey } : {}),
   });
+  // OpenRouter is a first-class provider = the Ollama backend hard-wired to
+  // OpenRouter's OpenAI-compatible endpoint, so its picker leads with the
+  // curated arena-winning models (RECOMMENDED_OPENROUTER_MODELS, MiMo/MiniMax
+  // tagged 1M · SOTA). Key comes from OPENROUTER_API_KEY (or the shared ollama
+  // key). Default model = the arena's top open-weight, MiMo v2.5.
+  const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+  let openrouterModel = process.env.COMFYUI_MCP_OPENROUTER_MODEL ?? "xiaomi/mimo-v2.5";
+  // Read the key FRESH each call (not a startup const) so a key the user sets
+  // later via the panel — setAgentSecret hydrates it into env — takes effect on
+  // the next backend build without an orchestrator restart.
+  const openrouterApiKey = () => process.env.OPENROUTER_API_KEY || process.env.COMFYUI_MCP_OLLAMA_API_KEY;
+  const openrouterDeps = () => {
+    const key = openrouterApiKey();
+    return {
+      api: "openai" as const,
+      host: OPENROUTER_BASE_URL,
+      ...(key ? { apiKey: key } : {}),
+    };
+  };
   // ── Per-tab backend (single-port multi-provider) ──────────────────────────
   // ONE orchestrator on ONE bridge port serves ALL providers; the panel picks a
   // provider per tab via the `hello`/`set_backend` handshake, instead of the node
@@ -688,6 +949,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     "glm",
     "kimi",
     "ollama",
+    "openrouter",
   ]);
   const defaultBackend = KNOWN_BACKENDS.has(backendId) ? backendId : "claude";
   const AGENT_KEY_SEP = "::";
@@ -900,6 +1162,16 @@ export async function runPanelOrchestrator(): Promise<void> {
         mcpServers: makeHttpBackendMcpServers(panelTabId),
       });
     }
+    if (backend === "openrouter") {
+      return new OllamaBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: openrouterModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+        ...openrouterDeps(),
+      });
+    }
     return undefined; // claude → built-in ClaudeBackend
   };
   logger.info(
@@ -929,7 +1201,9 @@ export async function runPanelOrchestrator(): Promise<void> {
                   ? new GlmBackend({ cwd: comfyuiPath ?? process.cwd(), model: glmModel })
                   : backend === "kimi"
                     ? new KimiBackend({ cwd: comfyuiPath ?? process.cwd(), model: kimiModel })
-                    : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
+                    : backend === "openrouter"
+                      ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: openrouterModel, ...openrouterDeps() })
+                      : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
       probeBackends.set(backend, pb);
     }
     return pb;
@@ -1049,7 +1323,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (!host || next === comfyuiUrl) return false;
     const prev = comfyuiUrl;
     comfyuiUrl = next;
-    comfyuiPath = isLoopbackUrl(next) ? envComfyuiPath : undefined;
+    comfyuiPath = localPathForTarget(next);
     // Point every provider at the new target: Claude via its rebuilt MCP env, the
     // manager's image-fetch URL, then respawn active agents so the live comfyui MCP
     // subprocess is recreated with the new COMFYUI_URL (no-op if none are running —
@@ -1089,6 +1363,24 @@ export async function runPanelOrchestrator(): Promise<void> {
     logger.info(
       `[panel-orchestrator] tool secret saved → comfyui MCP env updated + agents respawn on idle (keys: ${comfyuiSecretKeys().join(", ") || "none"})`,
     );
+  });
+
+  // An agent-provider secret changed (e.g. the OpenRouter API key set from the
+  // panel). Hydrate it into env, drop the cached openrouter probe/model list so
+  // the next probe uses the new key, and re-push readiness + models to every
+  // live tab so the OpenRouter provider flips to "ready" and lists its models
+  // without a reconnect.
+  const unsubscribeAgentSecrets = onAgentSecretsChanged(() => {
+    hydrateAgentSecretsIntoEnv();
+    modelsByBackend.delete("openrouter");
+    const pb = probeBackends.get("openrouter");
+    if (pb?.close) void pb.close().catch(() => {});
+    probeBackends.delete("openrouter");
+    for (const tabId of tabBackends.keys()) {
+      pushReadiness(tabId);
+      pushModels(tabId);
+    }
+    logger.info("[panel-orchestrator] OpenRouter key saved → provider readiness + models refreshed");
   });
 
   // Debounce the connect ack: the panel re-sends `hello` on reconnect and on
@@ -1132,7 +1424,26 @@ export async function runPanelOrchestrator(): Promise<void> {
             })
         : fetchSupportedModels(model);
       p = probe.then((list) => {
-        if (!list.length) modelsByBackend.delete(backend); // don't cache a failure
+        if (!list.length) modelsByBackend.delete(backend); // don't cache a failed probe
+        // User-curated preferred models (panel Settings → set_config) pin to the
+        // top of the ollama picker, ahead of the discovered catalog. Read fresh
+        // on every probe; set_config evicts the cache so edits apply live.
+        if (backend === "ollama") {
+          const preferred = getAgentSettings().preferredModels ?? [];
+          if (preferred.length) {
+            const discovered = new Map(list.map((m) => [m.value, m] as const));
+            list = [
+              ...preferred.map(
+                (id) =>
+                  (discovered.get(id) ?? {
+                    value: id,
+                    displayName: `${id} ★`,
+                  }) as unknown as ModelInfo,
+              ),
+              ...list.filter((m) => !preferred.includes(m.value as string)),
+            ];
+          }
+        }
         return list;
       });
       modelsByBackend.set(backend, p);
@@ -1150,6 +1461,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (backend === "chatgpt") return chatgptModel;
     if (backend === "glm") return glmModel;
     if (backend === "kimi") return kimiModel;
+    if (backend === "openrouter") return openrouterModel;
     return model;
   }
   function pushModels(panelTabId: string): void {
@@ -1277,9 +1589,28 @@ export async function runPanelOrchestrator(): Promise<void> {
       const isGl = backend === "glm";
       const isKm = backend === "kimi";
       const isOl = backend === "ollama";
+      const isOr = backend === "openrouter";
       // TRUTHFUL "connected": only claim ready after PROVING the SELECTED backend
       // can run, by probing its model list. If the probe fails — the "connected
       // but dead" wedge — send a degraded ack so the panel shows the real state.
+      // OpenRouter needs an explicit key check FIRST: its /models endpoint is
+      // PUBLIC, so the probe "succeeds" keyless and the tab would greet ready —
+      // then 401 on the first real message. Degrade up front instead.
+      if (isOr && !openrouterApiKey()) {
+        bridge.push(
+          {
+            type: "say",
+            text:
+              "⚠️ OpenRouter has no API key — the connection would fail on your first message. " +
+              "Set it in Settings → OpenRouter → “Set API key…” (masked, stored by the orchestrator — takes effect immediately, no reconnect needed), " +
+              "or set the OPENROUTER_API_KEY environment variable and restart the orchestrator. Keys: https://openrouter.ai/keys",
+          },
+          panelTab,
+        );
+        bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
+        logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (openrouter) but no API key — degraded ack`);
+        return;
+      }
       void ensureModels(backend)
         .then((models) => {
           if (models.length) {
@@ -1297,7 +1628,9 @@ export async function runPanelOrchestrator(): Promise<void> {
                         ? (kimiModel ?? (models[0] as { value?: string }).value ?? "Kimi")
                         : isOl
                           ? (ollamaModel ?? (models[0] as { value?: string }).value ?? "Ollama")
-                          : model;
+                          : isOr
+                            ? (openrouterModel ?? (models[0] as { value?: string }).value ?? "OpenRouter")
+                            : model;
             // Greet only on a FRESH session (a resume/reconnect already has the thread).
             if (!resume) {
               const readyText = isCx
@@ -1314,7 +1647,9 @@ export async function runPanelOrchestrator(): Promise<void> {
                           ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Kimi Code subscription. Ask away.`
                           : isOl
                             ? `🟢 comfyui-mcp agent ready — ${agentLabel} running locally via Ollama (no account, no API key). Small local models are slower and simpler than frontier ones — expect fewer frills. Ask away.`
-                            : `🟢 comfyui-mcp agent ready — ${agentLabel} on your Claude subscription. Ask away.`;
+                            : isOr
+                              ? `🟢 comfyui-mcp agent ready — ${agentLabel} via OpenRouter (hosted API, your OPENROUTER_API_KEY). Ask away.`
+                              : `🟢 comfyui-mcp agent ready — ${agentLabel} on your Claude subscription. Ask away.`;
               bridge.push({ type: "say", text: readyText }, panelTab);
             }
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
@@ -1333,8 +1668,10 @@ export async function runPanelOrchestrator(): Promise<void> {
                       : isKm
                         ? "⚠️ The background agent isn't responding — Kimi Code couldn't start. Run Kimi Code login (~/.kimi/credentials/kimi-code.json) or set KIMI_API_KEY, then Disconnect → Connect to retry."
                         : isOl
-                          ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull a tool-calling model (e.g. `ollama pull gemma4:e4b`), then Disconnect → Connect to retry."
-                          : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
+                          ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite; `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB), then Disconnect → Connect to retry."
+                          : isOr
+                            ? "⚠️ The background agent isn't responding — OpenRouter isn't reachable. Check your OPENROUTER_API_KEY and network, then Disconnect → Connect to retry."
+                            : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
             bridge.push({ type: "say", text: degradedText }, panelTab);
             bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
             logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) but model probe empty — degraded ack`);
@@ -1404,9 +1741,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       return;
     }
 
-    // Live panel config (currently just the render-stall threshold). Applied
-    // immediately, no reconnect — the next turn's watchdog check uses the new
-    // value. Sent by the panel on connect and whenever the setting changes.
+    // Live panel config: render-stall threshold, plus the user's agent-model
+    // preferences (preferred_models list + ollama endpoint config), persisted to
+    // ~/.comfyui-mcp/panel-settings.json. Sent by the panel on connect and
+    // whenever a setting changes. Model-list changes apply live (cache evicted,
+    // fresh `models` frame pushed); an endpoint change retargets NEW sessions —
+    // live ollama sessions keep their connection until restarted.
     if (event.type === "set_config" && event.tab_id) {
       if ("stall_seconds" in event) {
         setLiveStallSeconds((event as { stall_seconds?: unknown }).stall_seconds);
@@ -1414,7 +1754,75 @@ export async function runPanelOrchestrator(): Promise<void> {
           `[panel-orchestrator] live stall threshold → ${liveStallSeconds ?? "default"}s`,
         );
       }
+      const cfg = event as { preferred_models?: unknown; ollama?: unknown };
+      let ollamaChanged = false;
+      if (Array.isArray(cfg.preferred_models)) {
+        const ids = cfg.preferred_models.filter((m): m is string => typeof m === "string");
+        setAgentSettings({ preferredModels: ids });
+        ollamaChanged = true;
+        logger.info(`[panel-orchestrator] preferred models → [${ids.join(", ")}]`);
+      }
+      if (cfg.ollama && typeof cfg.ollama === "object") {
+        const o = cfg.ollama as { model?: unknown; api?: unknown; base_url?: unknown };
+        const patch: { model?: string; api?: "ollama" | "openai"; baseUrl?: string } = {};
+        if (typeof o.model === "string" && o.model.trim()) {
+          patch.model = o.model.trim();
+          if (!process.env.COMFYUI_MCP_OLLAMA_MODEL) ollamaModel = patch.model;
+        }
+        if (o.api === "openai" || o.api === "ollama") {
+          patch.api = o.api;
+          if (!process.env.COMFYUI_MCP_OLLAMA_API) ollamaApi = o.api;
+        }
+        if (typeof o.base_url === "string") {
+          patch.baseUrl = o.base_url.trim();
+          if (!process.env.COMFYUI_MCP_OLLAMA_BASE_URL) ollamaBaseUrl = patch.baseUrl || undefined;
+        }
+        if (Object.keys(patch).length) {
+          setAgentSettings({ ollama: patch });
+          ollamaChanged = true;
+          // Endpoint may have moved — drop the cached probe backend so the next
+          // readiness/model probe hits the NEW host/api with fresh deps.
+          const pb = probeBackends.get("ollama");
+          if (pb?.close) void pb.close().catch(() => {});
+          probeBackends.delete("ollama");
+          logger.info(
+            `[panel-orchestrator] ollama config → model=${ollamaModel} api=${ollamaApi} host=${ollamaBaseUrl ?? "(default)"}`,
+          );
+        }
+      }
+      if (ollamaChanged) {
+        modelsByBackend.delete("ollama");
+        pushModels(event.tab_id);
+      }
       bridge.push({ type: "ack", ok: true, kind: "config" }, event.tab_id);
+      return;
+    }
+
+    // Panel-initiated provider secret (Settings › "Set API key…") — NO agent, no
+    // chat: the panel paints its own masked input and ships the value here
+    // directly, over the same loopback/token-gated bridge the agent-initiated
+    // request_secret reply already rides. setAgentSecret enforces the allowlist
+    // (OPENROUTER_API_KEY), persists 0600, and hydrates process.env immediately,
+    // so the refreshed readiness frame flips the provider picker live — a user
+    // can enable OpenRouter before ANY backend is ready (no chicken-and-egg).
+    if (event.type === "set_secret" && event.tab_id) {
+      const rawKey = (event as { key?: unknown }).key;
+      const rawValue = (event as { value?: unknown }).value;
+      const key = typeof rawKey === "string" ? rawKey : "";
+      const value = typeof rawValue === "string" ? rawValue : "";
+      let error: string | undefined;
+      try {
+        if (!value.trim()) throw new Error("No token entered — nothing was saved.");
+        setAgentSecret(key, value.trim());
+        logger.info(`[panel-orchestrator] provider secret set from panel Settings: ${key} (redacted)`);
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
+      }
+      bridge.push(
+        { type: "secret_saved", key, ok: !error, ...(error ? { error } : {}) },
+        event.tab_id,
+      );
+      if (!error) pushReadiness(event.tab_id);
       return;
     }
 
@@ -1709,8 +2117,39 @@ export async function runPanelOrchestrator(): Promise<void> {
   const downloadTimer = setInterval(pollDownloads, 700);
   downloadTimer.unref?.();
 
+  // Keep the pod's stored bridge URL fresh so a ComfyUI RESTART self-heals fast.
+  // The panel's advertised wss:// URL/token lives in the pod ComfyUI process's
+  // MEMORY (the panel __init__'s advertise store). A restart — which the agent
+  // does after every custom-node install — WIPES it: the browser reloads,
+  // fetches an empty /bridge_url, falls back to the token-less
+  // ws://127.0.0.1:9180, and is rejected ("missing/invalid token"). It can't
+  // send a hello to trigger the on-hello re-advertise (line ~1452) BECAUSE it
+  // never gets a valid connection — a deadlock that only broke when something
+  // eventually nudged it, stranding the agent mid-task for minutes. Re-POSTing
+  // the advertise on a cheap idempotent timer repopulates the pod's store within
+  // one interval of any reboot (from any cause: the agent's restart, a Manager
+  // UI restart, a crash), so the browser's reclaim poll reconnects promptly.
+  // Only meaningful for a remote https target with a secure bridge.
+  let readvertiseTimer: ReturnType<typeof setInterval> | null = null;
+  if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) {
+    readvertiseTimer = setInterval(() => {
+      if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) void secureBridge.advertise(comfyuiUrl);
+    }, 5000);
+    readvertiseTimer.unref?.();
+  }
+
+  // The no-path suffix must not read as an error when it is BY DESIGN: for a
+  // remote target a local path is the wrong filesystem and is deliberately
+  // dropped — installs/downloads run host-side via ComfyUI-Manager (remote
+  // parity), so the agent is NOT install-limited there. Only a LOOPBACK target
+  // with no resolvable install is a real (and now rare, post-auto-detect) gap.
+  const pathNote = comfyuiPath
+    ? `, path=${comfyuiPath}`
+    : isLoopbackUrl(comfyuiUrl)
+      ? " — no local ComfyUI install found (COMFYUI_PATH unset, auto-detect came up empty); node/model installs still run via ComfyUI-Manager"
+      : " — remote target: installs/downloads run ON the ComfyUI host via its Manager (a local path would be the wrong filesystem; only local-FS tools like verify_custom_node are unavailable)";
   logger.info(
-    `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}, console on ${consoleUrl}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${comfyuiPath ? `, path=${comfyuiPath}` : " — no COMFYUI_PATH, local install/pack tools limited"})`,
+    `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}, console on ${consoleUrl}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${pathNote})`,
   );
 
   let shuttingDown = false;
@@ -1719,8 +2158,10 @@ export async function runPanelOrchestrator(): Promise<void> {
     shuttingDown = true;
     logger.info("[panel-orchestrator] shutting down — stopping agents…");
     clearInterval(downloadTimer);
+    if (readvertiseTimer) clearInterval(readvertiseTimer);
     QueueMonitor.stop();
     unsubscribeSecrets();
+    unsubscribeAgentSecrets();
     await manager.stopAll();
     // Dispose the readiness-probe backends (kills each Codex/Gemini CLI child).
     for (const pb of probeBackends.values()) {

@@ -42,7 +42,7 @@ import {
   removeUserMcpServer,
   setUserMcpServerSecret,
 } from "../services/user-mcp-config.js";
-import { setComfyuiSecret } from "../services/panel-secrets.js";
+import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../services/panel-secrets.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { getLoraCatalog, toLoraSummary } from "../services/lora-catalog.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
@@ -810,7 +810,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       {
         label: z.string().describe("Prompt shown above the masked input, e.g. 'Paste your CivitAI API token'."),
         target_kind: z.enum(["header", "env"]).describe("'header' for http/sse servers (e.g. Authorization); 'env' for stdio servers and the built-in comfyui server."),
-        mcp_server: z.string().describe("MCP server to attach the secret to: 'comfyui' for the built-in tools (download_civitai_model etc.), or a user-added server name like 'civitai'."),
+        mcp_server: z.string().describe("MCP server to attach the secret to: 'comfyui' for the built-in tools (download_civitai_model etc.), 'orchestrator' for orchestrator-level provider keys (OPENROUTER_API_KEY), or a user-added server name like 'civitai'."),
         key: z.string().describe("For 'comfyui': one of CIVITAI_API_TOKEN, HUGGINGFACE_TOKEN, HF_TOKEN (others rejected). For a user-added server: env var name or header name (e.g. 'Authorization')."),
         value_prefix: z.string().optional().describe("Optional string prepended to the token, e.g. 'Bearer '. Usually empty for env vars."),
         hint: z.string().optional().describe("Optional reassurance/help text shown under the input."),
@@ -825,6 +825,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return ok("No token entered — nothing was saved.");
           }
           const server = (args.mcp_server as string) ?? "";
+          // An ORCHESTRATOR provider secret (OpenRouter API key) — stored in the
+          // agent-secret slice of the 0600 config and hydrated into the
+          // orchestrator's OWN env, which flips the OpenRouter provider to ready
+          // and lists its models. NOT injected into the comfyui child.
+          if (server.toLowerCase() === "orchestrator" || isAllowedAgentSecretKey(args.key as string)) {
+            setAgentSecret(args.key as string, secret);
+            return ok(
+              `🔒 ${args.key} saved to your ~/.comfyui-mcp config. The OpenRouter provider is now enabled — pick it in the provider list.`,
+            );
+          }
           // The BUILT-IN comfyui server is NOT in the user's ~/.claude.json — the
           // orchestrator spawns it with its own env. Route its secrets to the
           // dedicated store, which injects them into that env and RESPAWNS the
@@ -1372,7 +1382,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_install_node",
-      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool.",
+      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
+        "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL). " +
+        "Install packs ONE AT A TIME and confirm each populated before the next — batching several installs then restarting is exactly how you end up with empty dirs and a broken restart.",
       {
         id: z.string().optional().describe("Registry id or 'author/repo'."),
         repository: z.string().optional().describe("Git URL (for a nightly/from-source install)."),

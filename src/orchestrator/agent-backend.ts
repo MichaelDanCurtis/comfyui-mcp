@@ -17,7 +17,8 @@ export type BackendId =
   | "grok"
   | "glm"
   | "kimi"
-  | "ollama";
+  | "ollama"
+  | "openrouter";
 
 /**
  * A user turn in PROVIDER-NEUTRAL form. PanelAgent owns the queue/turn-gate and

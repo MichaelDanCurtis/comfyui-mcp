@@ -431,8 +431,10 @@ export type GeminiMcpServerSpec =
 /**
  * Convert our MCP server specs into the ACP `session/new` `mcpServers` array.
  * ACP stdio McpServer: { name, command, args, env:[{name,value}] }. Streamable
- * HTTP MCP uses the SSE variant ({ type:"sse", name, url, headers:[] }) — the
- * live Grok/Gemini CLIs reject { type:"http" } with Invalid params.
+ * HTTP MCP rides the SSE variant ({ type:"sse", name, url, headers:[] }) — the
+ * live Gemini (and Grok) CLIs reject { type:"http" } with Invalid params on the
+ * FIRST user message, after a successful connect ack, so the old "http" mapping
+ * made a panel-MCP-attached tab look connected but fail on first use.
  */
 export function buildAcpMcpServers(
   servers: Record<string, GeminiMcpServerSpec>,

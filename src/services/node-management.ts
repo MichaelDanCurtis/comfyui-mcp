@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -13,11 +14,19 @@ import { logger } from "../utils/logger.js";
 //
 // Strategy (hybrid, confirmed with maintainer):
 //   1. Prefer the ComfyUI-Manager HTTP API (works against remote instances).
-//      Manager uses a unified queue model: POST a single task envelope to
-//      /v2/manager/queue/task, then POST /v2/manager/queue/start to begin
-//      processing, then poll /v2/manager/queue/status until the queue drains.
+//      TWO API GENERATIONS exist in the wild (issue #116), auto-detected per
+//      target by detectManagerApi():
+//        • v4 lineage (pip `comfyui_manager` ≥4.x, the `manager-v4` branch —
+//          what the RunPod image bakes): unified queue — POST one task
+//          envelope to /v2/manager/queue/task, then /v2/manager/queue/start,
+//          then poll /v2/manager/queue/status until the queue drains.
+//        • RELEASED Manager 3.x (`main`, the registry default): same queue
+//          engine under /manager/queue/* with PER-OPERATION routes
+//          (install/uninstall/update/fix/disable/install_model/update_all)
+//          and different body shapes — see legacyTaskRequest().
 //   2. Fall back to the cm-cli.py subprocess (against config.comfyuiPath) for
-//      anything the HTTP API can't do, or when the user forces it.
+//      anything the HTTP API can't do, or when the user forces it (local
+//      installs only — cm-cli needs the filesystem).
 //
 // API contract verified against the current Comfy-Org/ComfyUI-Manager (the
 // `glob` server, codegen'd from openapi.yaml). Every operation now flows through
@@ -172,6 +181,147 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---------------------------------------------------------------------------
+// Manager API generation detection (issue #116)
+//
+// The /v2/manager/* routes exist ONLY on the Manager v4 lineage (the
+// `manager-v4` branch / pip package, ≥4.x — what the RunPod image bakes).
+// The RELEASED ComfyUI-Manager (3.x `main`, what ComfyUI-Manager installs by
+// default) serves the same queue engine under /manager/* with PER-OPERATION
+// routes and different body shapes. Probe once per target and adapt.
+// ---------------------------------------------------------------------------
+
+type ManagerApi = "v2" | "legacy";
+
+let managerApiCache: { base: string; api: ManagerApi } | null = null;
+
+/** @internal — test hook so suites can pin/clear the detected generation. */
+export function resetManagerApiCacheForTests(api?: ManagerApi): void {
+  managerApiCache = api ? { base: managerBaseUrl(), api } : null;
+}
+
+async function detectManagerApi(): Promise<ManagerApi> {
+  const base = managerBaseUrl();
+  if (managerApiCache?.base === base) return managerApiCache.api;
+  const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", { soft: true });
+  if (v2 !== undefined) {
+    managerApiCache = { base, api: "v2" };
+    return "v2";
+  }
+  const legacy = await managerFetch<QueueStatus>("/manager/queue/status", { soft: true });
+  if (legacy !== undefined) {
+    managerApiCache = { base, api: "legacy" };
+    return "legacy";
+  }
+  throw new NodeManagementError(
+    "ComfyUI-Manager's queue API is not reachable (neither /v2/manager/queue/status " +
+      "nor /manager/queue/status answered). Is ComfyUI-Manager installed and enabled " +
+      "on the connected ComfyUI?",
+  );
+}
+
+/** Queue route prefix for the detected generation. */
+async function managerQueuePrefix(): Promise<string> {
+  return (await detectManagerApi()) === "v2" ? "/v2/manager/queue" : "/manager/queue";
+}
+
+/** Appended to every legacy-Manager operation failure so users know they're on
+ *  the partial feature set and how to get off it. */
+const MANAGER_UPGRADE_HINT =
+  "NOTE: this ComfyUI runs the LEGACY ComfyUI-Manager 3.x. comfyui-mcp is optimized " +
+  "for Manager v4+ — on 3.x some operations degrade or are unavailable (notably " +
+  "arbitrary-URL model downloads, which 3.x whitelist-gates). Recommend upgrading: " +
+  "`pip install -U comfyui_manager` in the ComfyUI python env, then disable the old " +
+  "custom_nodes/ComfyUI-Manager clone and restart. " +
+  "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
+
+/** Wrap a legacy-Manager failure with the upgrade guidance (keeps details). */
+function annotateLegacyError(err: unknown, kind: ManagerTaskKind): NodeManagementError {
+  const base = err instanceof Error ? err.message : String(err);
+  const extra =
+    kind === "install-model"
+      ? " Arbitrary-URL model installs REQUIRE Manager v4+ (3.x only accepts whitelisted catalog models)."
+      : "";
+  return new NodeManagementError(
+    `${base}${extra}\n${MANAGER_UPGRADE_HINT}`,
+    err instanceof NodeManagementError ? err.details : undefined,
+  );
+}
+
+/**
+ * Translate one unified-task call into the legacy per-operation route + body.
+ * Body shapes verified against ComfyUI-Manager 3.41 glob/manager_server.py:
+ * install/uninstall/update/fix/disable key on `version` ('unknown' → treat
+ * `files[0]` as a git URL / folder name), and install (unlike v4) accepts a
+ * REAL git URL natively via { version:'unknown', files:[url] }.
+ */
+function legacyTaskRequest(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown>,
+  uiId: string,
+): { path: string; body: Record<string, unknown> } {
+  const nodeName = (params.node_name ?? params.id) as string | undefined;
+  const version = (params.node_ver as string) || (params.selected_version as string) || "latest";
+  switch (kind) {
+    case "install":
+      return {
+        path: "/manager/queue/install",
+        body: {
+          ui_id: uiId,
+          id: params.id,
+          version: params.version ?? version,
+          selected_version: params.selected_version ?? version,
+          ...(params.files ? { files: params.files } : {}),
+          ...(params.repository ? { repository: params.repository } : {}),
+          ...(params.pip ? { pip: params.pip } : {}),
+          channel: params.channel ?? "default",
+          mode: params.mode ?? "cache",
+          ...(params.skip_post_install !== undefined
+            ? { skip_post_install: params.skip_post_install }
+            : {}),
+        },
+      };
+    case "enable":
+      // Legacy has no enable route — the UI re-installs with skip_post_install.
+      return {
+        path: "/manager/queue/install",
+        body: {
+          ui_id: uiId,
+          id: nodeName,
+          version,
+          selected_version: version,
+          skip_post_install: true,
+          channel: "default",
+          mode: "cache",
+        },
+      };
+    case "uninstall":
+      return {
+        path: "/manager/queue/uninstall",
+        body: { ui_id: uiId, id: nodeName, version },
+      };
+    case "update":
+      return {
+        path: "/manager/queue/update",
+        body: { ui_id: uiId, id: nodeName, version },
+      };
+    case "fix":
+      return {
+        path: "/manager/queue/fix",
+        body: { ui_id: uiId, id: nodeName, version },
+      };
+    case "disable":
+      return {
+        path: "/manager/queue/disable",
+        body: { ui_id: uiId, id: nodeName, version },
+      };
+    case "install-model":
+      // Same model-item body — but 3.x validates it against the model-list
+      // whitelist, so arbitrary-URL installs are rejected (v4-only feature).
+      return { path: "/manager/queue/install_model", body: { ...params, ui_id: uiId } };
+  }
+}
+
 /**
  * Tunable timing for queue polling. Defaults are production values; tests
  * shrink these via setQueueTimingForTests to keep the suite fast.
@@ -199,15 +349,16 @@ export function setQueueTimingForTests(
  * Returns the final queue status.
  */
 async function runManagerQueue(): Promise<QueueStatus> {
-  // /v2/manager/queue/start returns 200 (worker started) or 201 (already
-  // running) — both are 2xx, so managerFetch accepts either.
-  await managerFetch("/v2/manager/queue/start", { method: "POST" });
+  const prefix = await managerQueuePrefix();
+  // queue/start returns 200 (worker started) or 201 (already running) — both
+  // are 2xx, so managerFetch accepts either. Same on both generations.
+  await managerFetch(`${prefix}/start`, { method: "POST" });
 
   const start = Date.now();
   let lastStatus: QueueStatus | undefined;
   while (Date.now() - start < queueTiming.timeoutMs) {
     await sleep(queueTiming.pollIntervalMs);
-    const status = await managerFetch<QueueStatus>("/v2/manager/queue/status", {
+    const status = await managerFetch<QueueStatus>(`${prefix}/status`, {
       soft: true,
     });
     if (status) {
@@ -241,6 +392,17 @@ async function queueManagerTask(
   params: Record<string, unknown>,
 ): Promise<QueueStatus> {
   const uiId = randomUUID();
+  if ((await detectManagerApi()) === "legacy") {
+    // Released Manager 3.x: per-operation routes + different body shapes
+    // (issue #116 — the unified /v2 task route 405s there).
+    const { path, body } = legacyTaskRequest(kind, params, uiId);
+    try {
+      await managerFetch(path, { method: "POST", body });
+    } catch (err) {
+      throw annotateLegacyError(err, kind);
+    }
+    return runManagerQueue();
+  }
   await managerFetch("/v2/manager/queue/task", {
     method: "POST",
     body: {
@@ -807,22 +969,38 @@ export async function installCustomNode(
   }
 
   if (source === "git") {
-    // REGISTRY-FIRST, CLONE FALLBACK. The Manager backend resolves an install
-    // by the pack's REPO NAME / CNR id — NOT a full git URL (do_install splits
-    // `${id}@${selected_version}` and looks the result up in its DB; a full URL
-    // matches nothing and the queue silently marks the task "done"). So we mirror
-    // the frontend UI: id = repo name, selected_version = ref or "nightly" (the
-    // git-HEAD channel for unclaimed packs), channel "dev", mode "cache". The
-    // ignored `repository`/`pip` fields are dropped.
     const repoName = gitCheckoutDir(gitId);
-    const selected = gitRef ?? "nightly";
-    const status = await queueManagerTask("install", {
-      id: repoName,
-      version: selected,
-      selected_version: selected,
-      channel: opts.channel ?? "dev",
-      mode: opts.mode ?? "cache",
-    });
+    let status: QueueStatus;
+    if ((await detectManagerApi()) === "legacy") {
+      // Released Manager 3.x accepts a REAL git URL natively:
+      // { version:'unknown', files:[url] } clones it as an unregistered pack.
+      // (Gated server-side by security_level + the allow_git_url_install
+      // config — a rejection surfaces as a 403/404 from the queue route.)
+      status = await queueManagerTask("install", {
+        id: repoName,
+        version: "unknown",
+        selected_version: "unknown",
+        files: [gitId],
+        channel: opts.channel ?? "default",
+        mode: opts.mode ?? "cache",
+      });
+    } else {
+      // Manager v4: REGISTRY-FIRST, CLONE FALLBACK. The v4 backend resolves an
+      // install by the pack's REPO NAME / CNR id — NOT a full git URL
+      // (do_install splits `${id}@${selected_version}` and looks the result up
+      // in its DB; a full URL matches nothing and the queue silently marks the
+      // task "done"). So we mirror the frontend UI: id = repo name,
+      // selected_version = ref or "nightly" (the git-HEAD channel for unclaimed
+      // packs), channel "dev", mode "cache".
+      const selected = gitRef ?? "nightly";
+      status = await queueManagerTask("install", {
+        id: repoName,
+        version: selected,
+        selected_version: selected,
+        channel: opts.channel ?? "dev",
+        mode: opts.mode ?? "cache",
+      });
+    }
 
     // VERIFY: /v2/customnode/installed reflects on-disk custom_nodes, so a
     // freshly-cloned pack shows up even before a reboot. If the Manager actually
@@ -907,14 +1085,22 @@ export async function updateCustomNode(
     // JSON body — a body-only request leaves mode defaulting to 'remote' and
     // drops client_id/ui_id. Send them as URL query params.
     const uiId = randomUUID();
-    const query = new URLSearchParams({
-      mode,
-      client_id: MANAGER_CLIENT_ID,
-      ui_id: uiId,
-    }).toString();
-    await managerFetch(`/v2/manager/queue/update_all?${query}`, {
-      method: "POST",
-    });
+    if ((await detectManagerApi()) === "legacy") {
+      // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
+      await managerFetch("/manager/queue/update_all", {
+        method: "POST",
+        body: { mode, ui_id: uiId },
+      });
+    } else {
+      const query = new URLSearchParams({
+        mode,
+        client_id: MANAGER_CLIENT_ID,
+        ui_id: uiId,
+      }).toString();
+      await managerFetch(`/v2/manager/queue/update_all?${query}`, {
+        method: "POST",
+      });
+    }
     status = await runManagerQueue();
   } else {
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
@@ -1039,8 +1225,9 @@ export async function listInstalledNodes(
     }));
   }
 
+  const prefix = (await detectManagerApi()) === "v2" ? "/v2" : "";
   const raw = await managerFetch<unknown>(
-    `/v2/customnode/installed?mode=${encodeURIComponent(mode)}`,
+    `${prefix}/customnode/installed?mode=${encodeURIComponent(mode)}`,
   );
   return parseInstalled(raw);
 }
@@ -1113,6 +1300,76 @@ export interface InstallModelParams {
    * destination, or "default" for type-based resolution.
    */
   save_path?: string;
+  /**
+   * OUR canonical folder-paths category (e.g. "diffusion_models", "vae") —
+   * used ONLY for panel download-tray progress. When set and the panel
+   * progress channel is active, a background watcher reports an indeterminate
+   * tray row until the file shows up in the server's /models/<category>
+   * listing (in-progress files are hidden there, so "listed" = landed).
+   */
+  trayCategory?: string;
+}
+
+// Remote (Manager-dispatched) downloads run server-side: the queue reports
+// "done" at dispatch/aria2-handoff while the host still streams gigabytes, so
+// tray progress can't come from bytes we never see (issue #143). Instead, poll
+// the server's /models/<category> listing — verified live: an in-progress file
+// is NOT listed; it appears when the download completes.
+const REMOTE_LANDING_POLL_MS = 5_000;
+const REMOTE_LANDING_TIMEOUT_MS = 4 * 60 * 60 * 1000; // generous: multi-GB on slow links
+
+/**
+ * Background tray reporter for a server-side model download. Writes an
+ * indeterminate "downloading" row immediately (and as a heartbeat, so the
+ * orchestrator's 60s dead-writer sweep doesn't prune long downloads), then a
+ * terminal "done" when the filename appears in /models/<category>, or "error"
+ * if it never shows within the timeout. Fire-and-forget: the tool call returns
+ * at dispatch; this keeps the tray honest afterwards. No-op outside the panel
+ * (progress channel disabled).
+ */
+export function watchRemoteModelLanding(
+  category: string,
+  filename: string,
+  url: string,
+): void {
+  if (!progressEnabled()) return;
+  const id = createHash("sha256").update(url).digest("hex").slice(0, 16);
+  const row = { id, name: filename, downloaded: 0, total: 0, bytes_per_sec: 0 };
+  reportDownloadProgress({ ...row, status: "downloading" }, true);
+  const started = Date.now();
+  const timer = setInterval(() => {
+    void (async () => {
+      let listed = false;
+      try {
+        const res = await comfyuiFetch(
+          `${getComfyUIBaseUrl()}/models/${encodeURIComponent(category)}`,
+        );
+        if (res.ok) {
+          const names = (await res.json()) as unknown;
+          // Entries are relative paths ("file.safetensors" or "sub/file.safetensors").
+          listed =
+            Array.isArray(names) &&
+            names.some(
+              (n) =>
+                typeof n === "string" &&
+                (n === filename || n.endsWith(`/${filename}`) || n.endsWith(`\\${filename}`)),
+            );
+        }
+      } catch {
+        // Server briefly unreachable (e.g. mid-reboot) — keep waiting.
+      }
+      if (listed) {
+        clearInterval(timer);
+        reportDownloadProgress({ ...row, status: "done" }, true);
+      } else if (Date.now() - started > REMOTE_LANDING_TIMEOUT_MS) {
+        clearInterval(timer);
+        reportDownloadProgress({ ...row, status: "error" }, true);
+      } else {
+        reportDownloadProgress({ ...row, status: "downloading" }, true);
+      }
+    })();
+  }, REMOTE_LANDING_POLL_MS);
+  timer.unref?.();
 }
 
 /**
@@ -1145,24 +1402,37 @@ export async function installModelViaManager(
   const status = await queueManagerTask("install-model", taskParams);
   // NOTE: the Manager queue reports the task "done" once it DRAINS, even when
   // the underlying OperationResult failed (e.g. a 404 download, or Manager's
-  // security gate rejecting a network fetch). The v2 queue/status endpoint only
-  // exposes aggregate counts (no per-task result), so a clean drain here does
-  // NOT prove the file landed — phrase the result as "dispatched", not
+  // security gate rejecting a network fetch) — and with an aria2 sidecar
+  // (COMFYUI_MANAGER_ARIA2_SERVER) it drains at HANDOFF, while the host is
+  // still streaming gigabytes. The v2 queue/status endpoint only exposes
+  // aggregate counts (no per-task result), so a clean drain here does NOT
+  // prove the file landed — phrase the result as "dispatched", not
   // "installed", and leave final verification to a list on the pod.
   //
   // DEPLOYMENT: remote model install requires the pod's ComfyUI-Manager to be
   // in network_mode=personal_cloud (or loopback) with permissive security; a
   // stricter security_level rejects the server-side download.
+  if (params.trayCategory) {
+    watchRemoteModelLanding(params.trayCategory, params.filename, params.url);
+  }
   return {
     mechanism: "manager-http",
     message:
       `Dispatched model "${name}" (${params.filename}) to install into ` +
       `${params.type} on the connected ComfyUI via ComfyUI-Manager. The queue ` +
-      `drained, but Manager reports tasks "done" even on failure and exposes no ` +
-      `per-task result, so success is NOT guaranteed — verify the file landed on ` +
-      `the ComfyUI host (a restart may be required to see it). If nothing lands, ` +
-      `confirm Manager runs with network_mode=personal_cloud (or loopback) and a ` +
-      `permissive security level so server-side downloads aren't blocked.`,
+      `drained, but that only means the download was HANDED OFF (with an aria2 ` +
+      `sidecar the host keeps streaming after the queue drains), and Manager ` +
+      `reports tasks "done" even on failure with no per-task result — so ` +
+      `success is NOT guaranteed. The file appears in the server's ` +
+      `/models/<category> listing only once the download COMPLETES (in-progress ` +
+      `files are hidden), and Manager may store it under its own type dir ` +
+      `(e.g. unet/, clip/) which ComfyUI aliases to diffusion_models/` +
+      `text_encoders — an empty canonical folder mid-download is NORMAL, not a ` +
+      `failure. Wait and re-check before re-dispatching (duplicates waste ` +
+      `bandwidth); a restart may be required for loaders to see the file. If ` +
+      `nothing ever lands, confirm Manager runs with ` +
+      `network_mode=personal_cloud (or loopback) and a permissive security ` +
+      `level so server-side downloads aren't blocked.`,
     details: status,
   };
 }
