@@ -85,7 +85,6 @@ implementation cycle; #3 (the gateway) warrants its own full brainstorm.
 | Civitai | `CIVITAI_API_TOKEN` | model downloads |
 | HuggingFace | `HF_TOKEN`, `HUGGINGFACE_TOKEN` | model downloads |
 | Google / Gemini | `GEMINI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GOOGLE_API_KEY` | Nano Banana concept images |
-| xAI | `XAI_API_KEY` | Grok Imagine concept images |
 | GLM / Zhipu | `GLM_API_KEY`, `ZHIPU_API_KEY`, `ZHIPUAI_API_KEY`, `ZAI_API_KEY` | GLM provider |
 | Kimi (API) | `KIMI_API_KEY` | Kimi via API (vs OAuth) |
 | RunComfy | `RUNCOMFY_API_KEY` | cloud pods / training (foundation for #4) |
@@ -93,7 +92,9 @@ implementation cycle; #3 (the gateway) warrants its own full brainstorm.
 
 A `POST /api/secrets` for any key not in this allowlist is rejected (`400`). OAuth-CLI providers
 (Grok/Codex/Gemini/Kimi-default) are **not** fields here — the page shows a one-line
-"signed in via CLI — see OAuth Logins (coming in #2)" note.
+"signed in via CLI — see OAuth Logins (coming in #2)" note. xAI / Grok Imagine is OAuth-based
+(`grok login`; see `src/services/concept-image-auth.ts`) and has no API-key slot — it belongs to
+sub-project #2 (OAuth Logins), not this API-keys page.
 
 ## Security model
 
