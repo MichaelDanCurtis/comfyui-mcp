@@ -4,13 +4,16 @@ Use this after reloading ComfyUI (hard refresh the frontend) and restarting the 
 
 **Local paths (this machine)**
 
+> Single canonical environment. The standalone dev install (`~/ComfyUI-Installs`, ComfyUI :9500,
+> MCP instance `localhost_9500`) was retired 2026-07-08 — there is now one ComfyUI, on :8188.
+
 | Service | URL |
 |---------|-----|
-| ComfyUI | http://127.0.0.1:9500 |
+| ComfyUI | http://127.0.0.1:8188 |
 | Agent bridge | ws://127.0.0.1:9180 |
-| MCP Console | http://127.0.0.1:9182/ |
-| ComfyUI data | `/Users/michaelcurtis/Documents/ComfyUI` |
-| Panel source | `~/Documents/ComfyUI/custom_nodes/comfyui-agent-panel/` |
+| Panel MCP (orchestrator) | http://127.0.0.1:9181/ (open the MCP Console via the panel's **Open MCP Console** link) |
+| ComfyUI data / install | `/Users/michaelcurtis/Documents/ComfyUI/ComfyUI/ComfyUI` (models → `/Volumes/Main External/ComfyUI/models`) |
+| Panel source | `~/Documents/ComfyUI/ComfyUI/ComfyUI/custom_nodes/comfyui-agent-panel/` |
 | Orchestrator | `npx comfyui-mcp --panel-orchestrator` (or `npm link` local build) |
 
 **Before you start**
