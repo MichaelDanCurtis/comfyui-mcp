@@ -1059,11 +1059,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Default port bridge+2 (9180→9182). Opened from the panel Advanced section.
   let panelConsoleHttp: PanelConsoleHttpServer | null = null;
   const consolePort = Number(process.env.COMFYUI_MCP_CONSOLE_PORT) || bridgePort + 2;
+  const consoleToken = randomBytes(24).toString("hex");
   try {
     panelConsoleHttp = await startPanelConsoleHttpServer({
       port: consolePort,
       bridgePort,
       comfyuiUrl,
+      token: consoleToken,
     });
   } catch (err) {
     logger.warn(
@@ -1519,7 +1521,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   function pushReadiness(tabId: string): void {
     try {
       const { backends, any_ready } = allBackendReadiness(KNOWN_BACKENDS);
-      bridge.push({ type: "backends", backends, any_ready, console_url: consoleUrl }, tabId);
+      bridge.push({ type: "backends", backends, any_ready, console_url: consoleUrl, console_token: consoleToken }, tabId);
     } catch (err) {
       logger.warn(`[panel-orchestrator] readiness probe failed: ${err instanceof Error ? err.message : String(err)}`);
     }
