@@ -45,8 +45,10 @@ import {
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
 import { GrokBackend, GROK_DEFAULT_MODEL } from "./grok-backend.js";
-import { OllamaBackend } from "./ollama-backend.js";
-import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "./chatgpt-oauth-backend.js";
+import { OllamaBackend, OLLAMA_SYSTEM_PROMPT } from "./ollama-backend.js";
+import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL, CHATGPT_SYSTEM_PROMPT } from "./chatgpt-oauth-backend.js";
+import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
+import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
 import { GlmBackend, GLM_DEFAULT_MODEL } from "./glm-backend.js";
 import { KimiBackend, KIMI_DEFAULT_MODEL } from "./kimi-backend.js";
 import { allBackendReadiness } from "./backend-readiness.js";
@@ -67,6 +69,8 @@ import { WorkflowTargetStore } from "../services/workflow-target-store.js";
 const PANEL_SYSTEM_APPEND = `You are the autonomous assistant embedded directly in a ComfyUI sidebar panel. The person is working in ComfyUI and talks to you through that panel: their messages arrive as your prompts, and everything you write is shown to them in the panel chat. Write for that reader — lead with the result, keep replies short and concrete, and don't narrate routine internal steps.
 
 You can SEE and EDIT the workflow the user currently has open, via the panel_* tools (panel_get_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_get_errors, panel_save_workflow, …). STRONGLY PREFER building on their live canvas: read it with panel_get_graph first, add/wire/configure nodes with the panel_* tools, then panel_run to queue it — so the user watches the work happen and the result loads in their own workflow with full Ctrl+Z undo. Only fall back to the headless generate_image/enqueue_workflow tools when the user explicitly wants a one-off they don't need on their canvas, or when no panel tab is connected (a panel_* call will error if so). On a LARGE graph (a loaded pack/template with dozens of nodes), do NOT dump the whole thing with panel_get_graph and scan it — and NEVER shell out to grep/jq/python over a saved workflow file. To UNDERSTAND the graph, call panel_graph_outline FIRST: a compact, dependency-ordered TEXT map (nodes topologically sorted source→sink, each with its key widgets and ← inputs / → outputs wiring, plus a groups index) made for you to read top-to-bottom. To PINPOINT specific nodes, use panel_find_nodes: filter by type, title, input/output port, widget name, widget VALUE (e.g. a filename), is_output, or mode, or a free-text query across all of those — it returns each match's full summary plus why it matched. Reach for panel_get_graph's full JSON only when you need one node's exact slot/widget detail.
+
+PROMPT DIRECTOR AWARENESS. When the graph contains PromptDirector, PromptDirectorAuto, PromptDirectorContext, PromptProducer, or PromptDirectorResultCritic nodes, call panel_audit_prompt_director before declaring that the prompt/model/LoRA setup is correct or diagnosing a failed edit. The audit correlates live wiring and loader widgets with the nodes' resolved Model Explorer metadata, edit plan, LoRA compatibility/strengths, exact final prompt, warnings, and critic verdict. Surface concise, useful observations proactively (including when the configuration is coherent). Its recommendations are READ-ONLY proposals: ask before applying panel_set_widget/panel_connect changes unless the user already explicitly asked you to fix the workflow.
 
 TRUST REPORTED MANUAL CHANGES. The user can edit the canvas BY HAND between your turns (bypass/mute a node, change a widget, rewire, add/remove nodes). When that happens, your turn opens with a "⟳ MANUAL CANVAS CHANGES since your last turn" block listing exactly what they changed. Treat that block as GROUND TRUTH about the current graph — it overrides what you remember from earlier in the conversation. Do NOT assume the graph still matches your last edit or your earlier reading; if the listed changes are substantial (or contradict a plan you were mid-execution on), re-read with panel_graph_outline before you act or draw conclusions. This is also how you learn the user already tried something (e.g. they bypassed a node and it worked) — believe it over your own prior reasoning.
 
@@ -981,7 +985,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // just the static text (no env block). Built once; refreshed after a ComfyUI
   // restart/reconnect via refreshEnvCapabilities() below.
   let envCaps: EnvCapabilities | undefined;
-  let panelSystemAppend = PANEL_SYSTEM_APPEND;
+  let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
   // manager.opts.systemAppend at each spawn; Codex reads the closed-over
@@ -991,12 +995,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   async function refreshEnvCapabilities(): Promise<void> {
     try {
       envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId });
-      panelSystemAppend = buildPanelSystemAppend(PANEL_SYSTEM_APPEND, envCaps);
+      panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
       // Belt-and-suspenders: gather is internally guarded, but never let a stray
       // throw break the prompt — fall back to the static append.
-      panelSystemAppend = PANEL_SYSTEM_APPEND;
+      panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
       logger.debug(
         `[panel-orchestrator] env-capabilities probe failed (using static prompt): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1005,6 +1009,16 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Build it before any agent could spawn. Guarded so a probe stall can't block
   // orchestrator startup beyond the probes' own (short) timeouts.
   await refreshEnvCapabilities();
+
+  // Register every editable prompt's built-in default so the /prompts editor can
+  // list + reset each one (overrides persist in ~/.comfyui-mcp/panel-prompts.json).
+  // The persona is live-applied here; the other prompts are read fresh at each
+  // session/turn, so they take effect on the next spawn without an explicit push.
+  registerPrompt("panel.persona", "Panel agent persona (all backends)", PANEL_SYSTEM_APPEND, "Injected into every backend; applies live to running agents.");
+  registerPrompt("backend.chatgpt", "ChatGPT (OAuth) base prompt", CHATGPT_SYSTEM_PROMPT, "Applies on the next ChatGPT chat/session.");
+  registerPrompt("backend.ollama", "Ollama / OpenRouter base prompt", OLLAMA_SYSTEM_PROMPT, "Applies on the next local/OpenRouter session.");
+  registerPrompt("proposer.modelCard", "Model Explorer “Ask AI” curator", MODEL_CARD_SYSTEM, "Applies to the next Ask-AI proposal.");
+  onPromptsChanged(() => { void refreshEnvCapabilities(); });
 
   // Render watchdog: a passive WS to ComfyUI that tracks live run progress so we
   // can warn the agent about a stalled render or a queue backlog it can't see
@@ -1705,7 +1719,7 @@ export async function runPanelOrchestrator(): Promise<void> {
               bridge.push({ type: "say", text: readyText }, panelTab);
             }
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
-            logger.info(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
+            logger.debug(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
           } else {
             const degradedText = isCx
               ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
@@ -1801,10 +1815,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // live ollama sessions keep their connection until restarted.
     if (event.type === "set_config" && event.tab_id) {
       if ("stall_seconds" in event) {
+        const _prevStall = liveStallSeconds;
         setLiveStallSeconds((event as { stall_seconds?: unknown }).stall_seconds);
-        logger.info(
-          `[panel-orchestrator] live stall threshold → ${liveStallSeconds ?? "default"}s`,
-        );
+        // The panel re-sends set_config on every heartbeat; only log an ACTUAL change.
+        if (liveStallSeconds !== _prevStall) {
+          logger.info(
+            `[panel-orchestrator] live stall threshold → ${liveStallSeconds ?? "default"}s`,
+          );
+        }
       }
       const cfg = event as { preferred_models?: unknown; ollama?: unknown };
       let ollamaChanged = false;

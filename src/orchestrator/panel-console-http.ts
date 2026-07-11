@@ -14,6 +14,7 @@ import { listTrainingPacks } from "../services/training-pack.js";
 import { getLoraCatalog, loraPreviewsDir } from "../services/lora-catalog.js";
 import { photomapHealth } from "../services/photomap.js";
 import { setPanelSecret, listPanelSecretsMasked, CREDENTIAL_SLOTS } from "../services/panel-secrets.js";
+import { listPrompts, setPromptOverride, clearPromptOverride, isKnownPrompt } from "../services/prompt-overrides.js";
 import { logger } from "../utils/logger.js";
 
 const KNOWN_BACKENDS = [
@@ -364,6 +365,74 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+// Server-rendered "edit every prompt" page (opened from the panel). Same-origin, so
+// its fetches to /api/prompts need no CORS. Each prompt shows its effective text in a
+// textarea with Save + Reset; empty/Reset restores the built-in default (the store
+// never discards it), so a bad edit is always one click from recovery. The embedded
+// script uses string concatenation (not template literals) so it can live inside this
+// outer template literal without escaping headaches.
+function promptsHtml(token: string): string {
+  const cfg = JSON.stringify({ token });
+  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agent Prompts</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;padding:14px 16px;background:#0f1115;color:#e8eaed;font:13px/1.5 system-ui,sans-serif}
+  h1{font-size:16px;margin:0 0 2px}
+  .sub{opacity:.6;font-size:12px;margin-bottom:12px}
+  .p{border:1px solid #2a2f3a;border-radius:10px;padding:10px 12px;margin-bottom:12px;background:#141821}
+  .phead{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .plabel{font-weight:600;flex:1}
+  .badge{font-size:11px;padding:1px 7px;border-radius:10px;background:#263042;opacity:.85}
+  .badge.ov{background:#3a2f14;color:#f6c453}
+  .help{opacity:.55;font-size:11px;margin:0 0 6px}
+  textarea{width:100%;box-sizing:border-box;min-height:120px;resize:vertical;background:#0b0d12;border:1px solid #333;color:#ddd;border-radius:6px;padding:8px;font:12px/1.45 ui-monospace,Menlo,monospace}
+  .row{display:flex;gap:8px;margin-top:6px;align-items:center}
+  button{padding:6px 12px;border-radius:6px;border:1px solid #333;background:#1c2331;color:#e8eaed;cursor:pointer}
+  button.reset{background:transparent;opacity:.8}
+  .ok{color:#7ee081}.err{color:#f28b82}
+  .status{font-size:11px;margin-left:auto;opacity:.85}
+</style></head><body>
+  <h1>Agent Prompts</h1>
+  <div class="sub">Edit any prompt the orchestrator controls. Empty or <b>Reset</b> restores the built-in default — a bad edit is always one click from recovery.</div>
+  <div id="err" class="err" style="display:none;margin-bottom:8px"></div>
+  <div id="list">Loading…</div>
+  <script>
+    const CFG=${cfg};
+    const q="?token="+encodeURIComponent(CFG.token);
+    const list=document.getElementById("list"), errEl=document.getElementById("err");
+    const esc=(s)=>String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});
+    function card(p){
+      const d=document.createElement("div"); d.className="p";
+      d.innerHTML='<div class="phead"><span class="plabel">'+esc(p.label)+'</span><span class="badge '+(p.overridden?"ov":"")+'" data-badge>'+(p.overridden?"custom":"default")+'</span></div>'
+        +(p.help?'<p class="help">'+esc(p.help)+'</p>':'')
+        +'<textarea spellcheck="false"></textarea>'
+        +'<div class="row"><button data-save>Save</button><button class="reset" data-reset>Reset to default</button><span class="status" data-status></span></div>';
+      const ta=d.querySelector("textarea"), badge=d.querySelector("[data-badge]"), status=d.querySelector("[data-status]");
+      ta.value = p.override!=null ? p.override : p.default;
+      const setState=(pp)=>{ badge.textContent=pp.overridden?"custom":"default"; badge.classList.toggle("ov",!!pp.overridden); };
+      d.querySelector("[data-save]").onclick=async()=>{
+        status.textContent="saving…"; status.className="status";
+        try{ const r=await fetch("/api/prompts"+q,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({id:p.id,value:ta.value})});
+          const j=await r.json(); if(!r.ok||!j.ok) throw new Error(j.error||"save failed");
+          setState(j.prompt||{overridden:!!ta.value.trim()}); status.textContent="saved ✓"; status.className="status ok";
+        }catch(e){ status.textContent=String(e.message||e); status.className="status err"; }
+      };
+      d.querySelector("[data-reset]").onclick=async()=>{
+        status.textContent="resetting…"; status.className="status";
+        try{ const r=await fetch("/api/prompts"+q,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({id:p.id,reset:true})});
+          const j=await r.json(); if(!r.ok||!j.ok) throw new Error(j.error||"reset failed");
+          ta.value=(j.prompt&&j.prompt.default)||p.default; setState(j.prompt||{overridden:false}); status.textContent="reset ✓"; status.className="status ok";
+        }catch(e){ status.textContent=String(e.message||e); status.className="status err"; }
+      };
+      return d;
+    }
+    (async()=>{ try{ const r=await fetch("/api/prompts"+q); const j=await r.json(); if(!r.ok||!j.ok) throw new Error(j.error||"load failed");
+      list.innerHTML=""; for(const p of (j.prompts||[])) list.appendChild(card(p)); if(!list.children.length) list.textContent="No prompts registered.";
+    }catch(e){ list.textContent=""; errEl.style.display="block"; errEl.textContent="Couldn't load prompts — reconnect the panel. ("+String(e.message||e)+")"; } })();
+  </script></body></html>`;
+}
+
 export function startPanelConsoleHttpServer(opts: {
   port: number;
   host?: string;
@@ -376,6 +445,19 @@ export function startPanelConsoleHttpServer(opts: {
   const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? "/").split("?")[0];
     if (path === "/api/secrets") {
+      // CORS: the panel now edits credentials NATIVELY (a section in its Advanced
+      // box) instead of the same-origin iframe console, so the browser fetches this
+      // cross-origin (ComfyUI :8188 → console :9182). Reflect the Origin and answer
+      // the preflight. Still token-gated + loopback-bound, so reflecting any origin
+      // is safe — a page without the random per-session token just gets 401.
+      const origin = req.headers.origin;
+      if (origin) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "content-type");
+      }
+      if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       if (!tokenOk(req, opts.token)) { sendJson(res, 401, { ok: false, error: "unauthorized" }); return; }
       if (req.method === "GET") { sendJson(res, 200, { ok: true, slots: listPanelSecretsMasked() }); return; }
       if (req.method === "POST") {
@@ -395,6 +477,45 @@ export function startPanelConsoleHttpServer(opts: {
         return;
       }
       sendJson(res, 405, { ok: false, error: "method not allowed" });
+      return;
+    }
+    if (path === "/api/prompts") {
+      if (!tokenOk(req, opts.token)) { sendJson(res, 401, { ok: false, error: "unauthorized" }); return; }
+      if (req.method === "GET") { sendJson(res, 200, { ok: true, prompts: listPrompts() }); return; }
+      if (req.method === "POST") {
+        let body: any;
+        try { body = await readJsonBody(req); } catch { sendJson(res, 400, { ok: false, error: "bad json" }); return; }
+        const id = String(body?.id ?? "");
+        if (!id || !isKnownPrompt(id)) { sendJson(res, 400, { ok: false, error: "unknown prompt id" }); return; }
+        if (body?.reset === true) clearPromptOverride(id);
+        else setPromptOverride(id, String(body?.value ?? ""));
+        sendJson(res, 200, { ok: true, prompt: listPrompts().find((p) => p.id === id) ?? null });
+        return;
+      }
+      sendJson(res, 405, { ok: false, error: "method not allowed" });
+      return;
+    }
+    if (req.method === "POST" && path === "/api/ai/model-card") {
+      // Loopback-only (like /api/status) — runs a one-shot Claude proposal over the
+      // provided evidence; no secrets read/written, so no token gate. Model Explorer
+      // (ComfyUI, localhost) calls this to distill messy metadata into a proposal.
+      let body: any;
+      try { body = await readJsonBody(req); } catch { sendJson(res, 400, { ok: false, error: "bad json" }); return; }
+      const evidence = body?.evidence ?? body;
+      if (!evidence || typeof evidence !== "object" || !evidence.filename) {
+        sendJson(res, 400, { ok: false, error: "evidence with filename required" }); return;
+      }
+      try {
+        const { proposeModelCard } = await import("./ai-proposer.js");
+        const { proposal, raw } = await proposeModelCard(evidence, body?.model);
+        sendJson(res, proposal ? 200 : 502, {
+          ok: !!proposal, proposal,
+          ...(proposal ? {} : { error: "model did not return valid JSON", raw: raw.slice(0, 600) }),
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sendJson(res, 500, { ok: false, error: msg });
+      }
       return;
     }
     if (req.method === "GET" && path === "/api/status") {
@@ -462,6 +583,11 @@ export function startPanelConsoleHttpServer(opts: {
       const bound = server.address();
       const boundPort = bound && typeof bound === "object" ? bound.port : opts.port;
       sendFramedHtml(res, 200, credentialsHtml(CREDENTIAL_SLOTS, `http://${host}:${boundPort}`, opts.token ?? ""));
+      return;
+    }
+    if (req.method === "GET" && path === "/prompts") {
+      if (!tokenOk(req, opts.token)) { sendHtml(res, 401, "<p>Unauthorized — reconnect the panel.</p>"); return; }
+      sendFramedHtml(res, 200, promptsHtml(opts.token ?? ""));
       return;
     }
     if (req.method === "GET" && (path === "/" || path === "/console")) {

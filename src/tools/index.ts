@@ -40,6 +40,8 @@ import { registerApiNodesTools } from "./api-nodes.js";
 import { registerManagerConfigTools } from "./manager-config.js";
 import { registerManifestTools } from "./manifest.js";
 import { registerLoraManagerTools } from "./lora-manager.js";
+import { registerModelExplorerTools } from "./model-explorer.js";
+import { registerPromptDirectorTools } from "./prompt-director.js";
 import { registerConceptImageTools } from "./concept-image.js";
 import { registerToolkitTools } from "./toolkit.js";
 import { registerRunComfyTools } from "./runcomfy.js";
@@ -102,6 +104,8 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["server", registerUpdateComfyUITools],
   ["models", registerModelExtrasTools],
   ["models", registerLoraManagerTools],
+  ["models", registerModelExplorerTools],
+  ["workflow-authoring", registerPromptDirectorTools],
   ["images-assets", registerVaultTools],
   ["images-assets", registerConceptImageTools],
   ["models", registerExtraPathsTools],

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Optional login auto-start for the comfyui-mcp orchestrator.
+
+  It runs `open -a Terminal <launch-orchestrator.sh>` at login, so the orchestrator
+  starts in a VISIBLE Terminal window (never a hidden daemon) and the launcher's own
+  guard defers if one is already running. KeepAlive is intentionally OMITTED so a
+  window you close (or a hand-started orchestrator) is not respawned behind your back.
+
+  EDIT the path below to this repo's absolute location, then enable it yourself
+  (installing a LaunchAgent is a persistent-config change — your call, not mine):
+
+    cp com.comfyui-mcp.orchestrator.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.comfyui-mcp.orchestrator.plist
+
+  Disable with:
+    launchctl unload ~/Library/LaunchAgents/com.comfyui-mcp.orchestrator.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.comfyui-mcp.orchestrator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-a</string>
+    <string>Terminal</string>
+    <string>/Volumes/Main External/Development/comfyui-mcp/scripts/launch-orchestrator.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/comfyui-mcp-orchestrator.launch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/comfyui-mcp-orchestrator.launch.log</string>
+</dict>
+</plist>

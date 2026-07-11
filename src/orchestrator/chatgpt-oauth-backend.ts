@@ -10,9 +10,10 @@ import type { AgentEvent, BackendStartOptions, ModelChoice, NeutralTurn } from "
 import { CHATGPT_CAPABILITIES } from "./agent-backend.js";
 import { resolveOpenAICodexOAuth } from "../services/code-provider-auth.js";
 import { OllamaBackend, type OllamaBackendDeps } from "./ollama-backend.js";
+import { resolvePrompt } from "../services/prompt-overrides.js";
 
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const CHATGPT_SYSTEM_PROMPT = [
+export const CHATGPT_SYSTEM_PROMPT = [
   "You are the ComfyUI agent in a sidebar panel. Answer in Markdown.",
   "",
   "You have exactly six tools:",
@@ -301,7 +302,7 @@ export class ChatGptOAuthBackend extends OllamaBackend {
     if (fresh) this.turnHistory = [];
     yield { type: "session", sessionId: this.chatgptSessionId, model: this.model };
 
-    const instructions = [CHATGPT_SYSTEM_PROMPT, this.deps.systemAppend].filter(Boolean).join("\n\n");
+    const instructions = [resolvePrompt("backend.chatgpt", CHATGPT_SYSTEM_PROMPT), this.deps.systemAppend].filter(Boolean).join("\n\n");
 
     for await (const turn of opts.channel) {
       yield* this.runCodexTurn(turn, instructions, opts);
