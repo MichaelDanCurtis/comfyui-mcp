@@ -26,6 +26,7 @@ const KNOWN_BACKENDS = [
   "glm",
   "kimi",
   "ollama",
+  "copilot", // EXPERIMENTAL — see orchestrator/index.ts's copilotModel comment
 ] as const;
 
 export interface PanelConsoleHttpServer {
