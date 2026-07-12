@@ -469,3 +469,104 @@ describe("panel-tools: workflow target (per-workflow agent)", () => {
     expect(text).toContain("Pinned");
   });
 });
+
+describe("panel-tools: node-menu editor (panel_menu_*)", () => {
+  it("registers all four node-menu tools in the shared def list", () => {
+    const names = buildPanelToolDefs().map((d) => d.name);
+    for (const expected of [
+      "panel_menu_read",
+      "panel_menu_propose",
+      "panel_menu_apply",
+      "panel_menu_reset",
+    ]) {
+      expect(names).toContain(expected);
+    }
+  });
+
+  it("panel_menu_read takes no args and forwards menu_read", async () => {
+    const def = defByName("panel_menu_read");
+    expect(Object.keys(def.schema)).toEqual([]);
+    const { ctx, calls } = makeFakeCtx();
+    await def.handler({}, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "menu_read" });
+  });
+
+  it("panel_menu_propose exposes a diff + optional strategy schema", () => {
+    const def = defByName("panel_menu_propose");
+    expect(Object.keys(def.schema).sort()).toEqual(["diff", "strategy"]);
+    const strategy = def.schema.strategy as { safeParse: (v: unknown) => { success: boolean } };
+    expect(strategy.safeParse("function-first").success).toBe(true);
+    expect(strategy.safeParse("clean-in-place").success).toBe(true);
+    expect(strategy.safeParse("hybrid").success).toBe(true);
+    expect(strategy.safeParse("bogus").success).toBe(false);
+    expect(strategy.safeParse(undefined).success).toBe(true);
+  });
+
+  it("panel_menu_propose forwards a valid scoped diff + strategy as menu_propose", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const diff = { nodes: { KSampler: { category: "Sampling/Core", hidden: false } } };
+    const res = await def.handler({ diff, strategy: "function-first" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(calls[0]).toMatchObject({ cmd: "menu_propose", strategy: "function-first" });
+    expect(calls[0].diff).toMatchObject(diff);
+  });
+
+  it("panel_menu_propose rejects a diff with a non-empty-string id violation without forwarding", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler({ diff: { nodes: { "": { category: "x" } } } }, ctx);
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("panel_menu_propose rejects an unknown-shaped diff entry without forwarding", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler({ diff: { nodes: { KSampler: { bogus: true } } } }, ctx);
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("panel_menu_propose rejects an over-cap string field without forwarding", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler(
+      { diff: { nodes: { KSampler: { displayName: "x".repeat(201) } } } },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("panel_menu_apply requires a diff object and forwards menu_apply", async () => {
+    const def = defByName("panel_menu_apply");
+    expect(Object.keys(def.schema)).toEqual(["diff"]);
+    const { ctx, calls } = makeFakeCtx();
+    const diff = { nodes: { KSampler: { displayName: "Sampler" } } };
+    const res = await def.handler({ diff }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(calls[0]).toMatchObject({ cmd: "menu_apply" });
+    expect(calls[0].diff).toMatchObject(diff);
+  });
+
+  it("panel_menu_apply rejects a malformed diff without forwarding", async () => {
+    const def = defByName("panel_menu_apply");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler({ diff: { nodes: { KSampler: { category: 5 } } } }, ctx);
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("panel_menu_reset requires a non-empty scope and forwards menu_reset", async () => {
+    const def = defByName("panel_menu_reset");
+    expect(Object.keys(def.schema)).toEqual(["scope"]);
+    const scope = def.schema.scope as { safeParse: (v: unknown) => { success: boolean } };
+    expect(scope.safeParse("all").success).toBe(true);
+    expect(scope.safeParse("KSampler").success).toBe(true);
+    expect(scope.safeParse("").success).toBe(false);
+    const { ctx, calls } = makeFakeCtx();
+    await def.handler({ scope: "all" }, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "menu_reset", scope: "all" });
+  });
+});

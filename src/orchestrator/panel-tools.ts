@@ -83,6 +83,90 @@ function fail(err: unknown): ToolResult {
 
 const slotRef = z.union([z.string(), z.number().int().min(0)]);
 
+// ---- node-menu editor diff validation (panel_menu_propose/panel_menu_apply) --
+// LOCKSTEP: mirrors the caps + diff shape enforced by cmcp-node-menu-model.js's
+// NM_CAPS/validateMap/applyDiff on the panel side (maxPathLen/maxLabelLen: 200
+// chars, non-empty ids, sparse per-field patches where `null` clears a field).
+// This wall rejects here so the agent gets a retryable tool error; the panel's
+// applyMenuDiff() re-validates before ever mutating the live override map —
+// same relationship as panel_ui_render's validateA2UISpecServer + the panel's
+// own validateA2UISpec.
+const MENU_DIFF_MAX_STR = 200;
+
+interface MenuDiff {
+  nodes?: Record<
+    string,
+    { category?: string | null; displayName?: string | null; hidden?: boolean | null; favorite?: boolean | null }
+  >;
+  favoritesOrder?: string[];
+}
+
+function validateMenuDiff(raw: unknown): { ok: true; diff: MenuDiff } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, errors: ["diff must be an object"] };
+  }
+  const r = raw as Record<string, unknown>;
+  const allowedTopKeys = new Set(["nodes", "favoritesOrder"]);
+  for (const k of Object.keys(r)) {
+    if (!allowedTopKeys.has(k)) errors.push(`unknown top-level key "${k}"`);
+  }
+  const out: MenuDiff = {};
+  if (r.nodes !== undefined) {
+    if (!r.nodes || typeof r.nodes !== "object" || Array.isArray(r.nodes)) {
+      errors.push("nodes must be an object keyed by node id");
+    } else {
+      const nodes: MenuDiff["nodes"] = {};
+      for (const [id, patchRaw] of Object.entries(r.nodes as Record<string, unknown>)) {
+        if (!id || id.length > MENU_DIFF_MAX_STR) {
+          errors.push(id ? `"${id}": id too long` : "node id must be non-empty");
+          continue;
+        }
+        if (!patchRaw || typeof patchRaw !== "object" || Array.isArray(patchRaw)) {
+          errors.push(`"${id}": entry must be an object`);
+          continue;
+        }
+        const patch = patchRaw as Record<string, unknown>;
+        const allowedPatchKeys = new Set(["category", "displayName", "hidden", "favorite"]);
+        for (const k of Object.keys(patch)) {
+          if (!allowedPatchKeys.has(k)) errors.push(`"${id}": unknown field "${k}"`);
+        }
+        const outPatch: Record<string, unknown> = {};
+        for (const f of ["category", "displayName"]) {
+          if (!(f in patch)) continue;
+          const v = patch[f];
+          if (v !== null && (typeof v !== "string" || v.length > MENU_DIFF_MAX_STR)) {
+            errors.push(`"${id}": ${f} must be a string (<=${MENU_DIFF_MAX_STR} chars) or null`);
+          } else {
+            outPatch[f] = v;
+          }
+        }
+        for (const f of ["hidden", "favorite"]) {
+          if (!(f in patch)) continue;
+          const v = patch[f];
+          if (v !== null && typeof v !== "boolean") {
+            errors.push(`"${id}": ${f} must be a boolean or null`);
+          } else {
+            outPatch[f] = v;
+          }
+        }
+        nodes[id] = outPatch;
+      }
+      out.nodes = nodes;
+    }
+  }
+  if (r.favoritesOrder !== undefined) {
+    const arr = r.favoritesOrder;
+    if (!Array.isArray(arr) || arr.some((x) => typeof x !== "string" || !x || x.length > MENU_DIFF_MAX_STR)) {
+      errors.push(`favoritesOrder must be an array of non-empty id strings (<=${MENU_DIFF_MAX_STR} chars)`);
+    } else {
+      out.favoritesOrder = arr as string[];
+    }
+  }
+  if (errors.length) return { ok: false, errors: errors.slice(0, 10) };
+  return { ok: true, diff: out };
+}
+
 // ---- server-side pack workflow resolution (for panel_load_workflow) --------
 // Read a bundled pack's UI workflow.json on the SERVER so the (large) graph
 // never has to shuttle through the agent's conversation. Mirrors the package-
@@ -1564,6 +1648,57 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (!v.ok) return fail(`invalid a2ui spec: ${v.errors.join("; ")}`);
         return ctx.call({ cmd: "ui_update", card_id: args.card_id, spec: v.spec }, 15000);
       },
+    ),
+    def(
+      "panel_menu_read",
+      "Read the LIVE node-menu registry the user browses in 'Add Node' (both the classic LiteGraph search and the Vue sidebar): every registered node's id, its pack-shipped category/displayName, which pack it came from, a rough usage count, and its EFFECTIVE presentation after any override already applied. This is your planning input for a menu cleanup — ALWAYS call this first so panel_menu_propose's diff reflects the live registry, not a stale guess. Read-only.",
+      {},
+      async (_args, ctx) => ctx.call({ cmd: "menu_read" }),
+    ),
+    def(
+      "panel_menu_propose",
+      "Propose a node-menu cleanup to the user as a reviewable before→after card. Call panel_menu_read FIRST, then pass a SCOPED `diff` — only the node ids you're actually changing, never a dump of the whole registry. Shape: { nodes: { <node id>: { category?, displayName?, hidden?, favorite? } }, favoritesOrder?: [ids] } — set a field to null to clear that override back to the pack default; omit fields you aren't touching on a given node. Pick one of three strategies and pass it as `strategy` (shown on the card): 'function-first' (regroup by what a node DOES, ignoring which pack it shipped in), 'clean-in-place' (keep each pack's own categories, just rename/hide noisy or duplicate entries), or 'hybrid' (function-first for a few high-traffic categories, leave the long tail alone). This call only RENDERS the card and returns {shown:true} — it does NOT change anything yet. After calling this, END YOUR TURN: the user's Apply/Cancel click becomes their next chat message, and clicking Apply applies the diff immediately in the panel. Everything here is a PRESENTATION-ONLY override (category/label/visibility/favorite, never the node's actual type or behavior) and is fully reversible with panel_menu_reset.",
+      {
+        diff: z
+          .record(z.string(), z.unknown())
+          .describe(
+            "{ nodes: { <node id>: { category?, displayName?, hidden?, favorite? } }, favoritesOrder?: [ids] } — a SCOPED diff (only the nodes you're changing). A field set to null clears that override.",
+          ),
+        strategy: z
+          .enum(["function-first", "clean-in-place", "hybrid"])
+          .optional()
+          .describe("Which of the three cleanup strategies this diff follows — shown on the proposal card."),
+      },
+      async (args: A, ctx) => {
+        const v = validateMenuDiff(args.diff);
+        if (!v.ok) return fail(`invalid node-menu diff: ${v.errors.join("; ")}`);
+        return ctx.call({ cmd: "menu_propose", diff: v.diff, strategy: args.strategy });
+      },
+    ),
+    def(
+      "panel_menu_apply",
+      "Apply a node-menu presentation diff DIRECTLY, without showing a proposal card first. Use this ONLY when the user has already explicitly approved the exact change (e.g. they told you precisely what to rename/hide/regroup, or they replied approving a panel_menu_propose card in a way that needs a follow-up tweak) — for anything the user hasn't pre-approved, use panel_menu_propose instead so they can review a before→after card. Same `diff` shape as panel_menu_propose: { nodes: { <node id>: { category?, displayName?, hidden?, favorite? } }, favoritesOrder?: [ids] } (null clears a field). Reversible with panel_menu_reset.",
+      {
+        diff: z
+          .record(z.string(), z.unknown())
+          .describe("{ nodes: { <node id>: { category?, displayName?, hidden?, favorite? } }, favoritesOrder?: [ids] }."),
+      },
+      async (args: A, ctx) => {
+        const v = validateMenuDiff(args.diff);
+        if (!v.ok) return fail(`invalid node-menu diff: ${v.errors.join("; ")}`);
+        return ctx.call({ cmd: "menu_apply", diff: v.diff });
+      },
+    ),
+    def(
+      "panel_menu_reset",
+      "Reset node-menu presentation overrides back to the pack-shipped defaults — pass a specific node id to reset just that one node, or \"all\" to clear every override (every rename, recategorization, hide, and favorite). Use this to undo a cleanup the user didn't like.",
+      {
+        scope: z
+          .string()
+          .min(1)
+          .describe('A node id (from panel_menu_read) to reset just that node, or "all" to clear every override.'),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "menu_reset", scope: args.scope }),
     ),
     def(
       "panel_open_lora_manager",
