@@ -580,6 +580,19 @@ describe("panel-tools: node-menu editor (panel_menu_*)", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("panel_menu_propose REJECTS angle brackets in a label without forwarding (injection hardening)", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler({ diff: { nodes: { KSampler: { category: "<img src=x>" } } } }, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toContain("< or >");
+    expect(calls).toHaveLength(0);
+    // displayName too
+    const res2 = await def.handler({ diff: { nodes: { KSampler: { displayName: "K<b>" } } } }, ctx);
+    expect(res2.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
   it("panel_menu_propose REJECTS an unknown top-level diff key without forwarding", async () => {
     const def = defByName("panel_menu_propose");
     const { ctx, calls } = makeFakeCtx();

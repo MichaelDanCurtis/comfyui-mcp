@@ -142,6 +142,12 @@ function validateMenuDiff(raw: unknown): { ok: true; diff: MenuDiff } | { ok: fa
           const v = patch[f];
           if (v !== null && (typeof v !== "string" || v.length > MENU_DIFF_MAX_STR)) {
             errors.push(`"${id}": ${f} must be a string (<=${MENU_DIFF_MAX_STR} chars) or null`);
+          } else if (typeof v === "string" && /[<>]/.test(v)) {
+            // Lockstep with cmcp-node-menu-model.js normNodeEntry's angle-bracket check —
+            // menu labels have no legitimate use for < or >, and this is a new writer path
+            // (prompt-injected web → agent → panel_menu_apply → t.title, which downstream
+            // LiteGraph context menus may render via innerHTML). Reject as injection hardening.
+            errors.push(`"${id}": ${f} may not contain < or >`);
           } else if (f === "category" && typeof v === "string" && v.split("/").length > MENU_DIFF_MAX_DEPTH) {
             // Lockstep with cmcp-node-menu-model.js normNodeEntry's maxDepth check —
             // reject a too-deep category HERE so it can't pass propose then fail apply.
