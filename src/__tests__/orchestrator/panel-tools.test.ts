@@ -558,6 +558,44 @@ describe("panel-tools: node-menu editor (panel_menu_*)", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("panel_menu_propose ACCEPTS a null field (clears an override) and forwards it", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const diff = { nodes: { KSampler: { category: null } } };
+    const res = await def.handler({ diff }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(calls[0]).toMatchObject({ cmd: "menu_propose" });
+    // null survives validation as the value that clears the override.
+    expect((calls[0].diff as { nodes: Record<string, { category: unknown }> }).nodes.KSampler.category).toBeNull();
+  });
+
+  it("panel_menu_propose REJECTS an over-depth category (13 segments) without forwarding", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    // 13 slash-separated segments — under the 200-char string cap but past maxDepth (12).
+    const deepCategory = Array.from({ length: 13 }, (_, i) => `s${i}`).join("/");
+    const res = await def.handler({ diff: { nodes: { KSampler: { category: deepCategory } } } }, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toContain("too deep");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("panel_menu_propose REJECTS an unknown top-level diff key without forwarding", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler({ diff: { nodes: { KSampler: { hidden: true } }, bogus: 1 } }, ctx);
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("panel_menu_propose REJECTS a favoritesOrder that isn't an array of strings without forwarding", async () => {
+    const def = defByName("panel_menu_propose");
+    const { ctx, calls } = makeFakeCtx();
+    const res = await def.handler({ diff: { favoritesOrder: [1, 2, 3] } }, ctx);
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
   it("panel_menu_reset requires a non-empty scope and forwards menu_reset", async () => {
     const def = defByName("panel_menu_reset");
     expect(Object.keys(def.schema)).toEqual(["scope"]);

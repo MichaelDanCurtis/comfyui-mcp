@@ -86,12 +86,17 @@ const slotRef = z.union([z.string(), z.number().int().min(0)]);
 // ---- node-menu editor diff validation (panel_menu_propose/panel_menu_apply) --
 // LOCKSTEP: mirrors the caps + diff shape enforced by cmcp-node-menu-model.js's
 // NM_CAPS/validateMap/applyDiff on the panel side (maxPathLen/maxLabelLen: 200
-// chars, non-empty ids, sparse per-field patches where `null` clears a field).
-// This wall rejects here so the agent gets a retryable tool error; the panel's
-// applyMenuDiff() re-validates before ever mutating the live override map —
-// same relationship as panel_ui_render's validateA2UISpecServer + the panel's
-// own validateA2UISpec.
+// chars → MENU_DIFF_MAX_STR; maxDepth: 12 category path segments →
+// MENU_DIFF_MAX_DEPTH; non-empty ids; sparse per-field patches where `null`
+// clears a field). This wall rejects here so the agent gets a retryable tool
+// error; the panel's applyMenuDiff() re-validates before ever mutating the live
+// override map — same relationship as panel_ui_render's validateA2UISpecServer +
+// the panel's own validateA2UISpec. Keeping the category DEPTH cap in lockstep
+// matters: without it a 13-segment category (under 200 chars) would pass
+// panel_menu_propose and render an Apply card, then fail at panel_menu_apply
+// ("category too deep") — a confusing post-approval silent failure.
 const MENU_DIFF_MAX_STR = 200;
+const MENU_DIFF_MAX_DEPTH = 12;
 
 interface MenuDiff {
   nodes?: Record<
@@ -137,6 +142,10 @@ function validateMenuDiff(raw: unknown): { ok: true; diff: MenuDiff } | { ok: fa
           const v = patch[f];
           if (v !== null && (typeof v !== "string" || v.length > MENU_DIFF_MAX_STR)) {
             errors.push(`"${id}": ${f} must be a string (<=${MENU_DIFF_MAX_STR} chars) or null`);
+          } else if (f === "category" && typeof v === "string" && v.split("/").length > MENU_DIFF_MAX_DEPTH) {
+            // Lockstep with cmcp-node-menu-model.js normNodeEntry's maxDepth check —
+            // reject a too-deep category HERE so it can't pass propose then fail apply.
+            errors.push(`"${id}": category too deep (max ${MENU_DIFF_MAX_DEPTH} segments)`);
           } else {
             outPatch[f] = v;
           }
