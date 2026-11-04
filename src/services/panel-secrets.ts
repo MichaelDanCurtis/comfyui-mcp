@@ -65,6 +65,7 @@ export const COMFYUI_SECRET_ENV_ALLOWLIST = [
   "GEMINI_API_KEY",
   "GOOGLE_GENERATIVE_AI_API_KEY",
   "GOOGLE_API_KEY",
+  "XAI_API_KEY",
   "RUNCOMFY_API_KEY",
   "REGISTRY_ACCESS_TOKEN",
 ] as const;
@@ -338,6 +339,7 @@ export const CREDENTIAL_SLOTS: CredentialSlot[] = [
   { id: "civitai", label: "Civitai", envKeys: ["CIVITAI_API_TOKEN"], store: "comfyui", help: "Model downloads" },
   { id: "huggingface", label: "HuggingFace", envKeys: ["HF_TOKEN", "HUGGINGFACE_TOKEN"], store: "comfyui", help: "Model downloads" },
   { id: "google", label: "Google / Gemini", envKeys: ["GEMINI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"], store: "comfyui", help: "Nano Banana concept images" },
+  { id: "xai", label: "xAI", envKeys: ["XAI_API_KEY"], store: "comfyui", help: "Grok Imagine (API key; or Grok OAuth in OAuth Logins)" },
   { id: "runcomfy", label: "RunComfy", envKeys: ["RUNCOMFY_API_KEY"], store: "comfyui", help: "Cloud pods / training" },
   { id: "registry", label: "Comfy Registry", envKeys: ["REGISTRY_ACCESS_TOKEN"], store: "comfyui", help: "Publishing custom nodes" },
 ];
