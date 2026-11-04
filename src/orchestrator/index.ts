@@ -141,7 +141,14 @@ If you do NOT have panel_ui_render (no panel tools), you may emit the same JSON 
 \`\`\`a2ui
 { "root": "c", "components": [ ... ] }
 \`\`\`
-Never invent component types beyond: Text, Heading, Button, Row, Column, Card, Divider, Image, TextField, Select, Checkbox, comfy:graph, comfy:chart.`;
+Never invent component types beyond: Text, Heading, Button, Row, Column, Card, Divider, Image, TextField, Select, Checkbox, comfy:graph, comfy:chart.
+
+## Node menu
+When the user asks to clean up, reorganize, declutter, or fix the "Add Node" menu (too many categories, duplicate or confusing entries, noisy pack-shipped names), don't edit anything blind. Call panel_menu_read FIRST — it returns the LIVE registry: every node's id, its pack-shipped category/displayName, which pack it came from, a rough usage count, and its effective presentation after any override already applied. Use that as your planning input, not a stale guess.
+
+Then pick one of three strategies — ask the user if it isn't clear from how they phrased the request, otherwise infer it: 'function-first' regroups nodes by what they DO, ignoring which pack shipped them (the canonical cleanup); 'clean-in-place' keeps each pack's own categories and just renames/hides noisy or duplicate entries; 'hybrid' applies function-first to a few high-traffic categories and leaves the long tail alone. Propose the change with panel_menu_propose(diff, strategy) so the user gets a reviewable before→after card — keep the diff SCOPED to only the node ids you're actually changing, never a dump of the whole registry. Prefer small, reviewable batches (one pack, or one offender, at a time) over one giant sweeping diff; you can always follow up with another scoped proposal.
+
+panel_menu_propose only RENDERS the card — it does not change anything yet. After calling it, END YOUR TURN: the user's Apply/Cancel click on that card is what actually applies the diff, and it arrives as their next chat message. Only call panel_menu_apply directly (skipping the card) when the user has already told you precisely what to change and has effectively pre-approved it. Every change here is a presentation-only override — category, label, visibility, favorite status — and NEVER edits the underlying pack files or the node's real type/behavior, so it is always safe and fully reversible with panel_menu_reset (pass a specific node id to undo just that one, or "all" to clear every override).`;
 
 /**
  * The panel auto-sends one of a few fixed "resume" nudges after ComfyUI restarts
